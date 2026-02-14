@@ -18,7 +18,7 @@ const {
     Faq,
     ManualSection
 } = require('../models');
-const bcrypt = require('bcrypt');
+const bcrypt = require('bcryptjs');
 const { buildAuthPayload } = require('./authController');
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;

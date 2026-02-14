@@ -6,9 +6,11 @@ const { connectDB } = require('./config/database');
 const rateLimit = require('./middleware/rateLimit');
 
 dotenv.config();
-// Fallback to parent directory if .env not found in current (for unified structure)
+
+// Consolidated environment loading: check current dir, then parent dir
 if (!process.env.MONGODB_URI) {
-    dotenv.config({ path: path.join(__dirname, '..', '.env') });
+    const rootEnvPath = path.join(__dirname, '..', '.env');
+    dotenv.config({ path: rootEnvPath });
 }
 
 const app = express();
