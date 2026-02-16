@@ -96,13 +96,14 @@ const ensureIpAllowed = async (req, user) => {
         .map(v => v.trim())
         .filter(Boolean);
 
+    // 1. Check if IP is explicitly in system allowlist (hardcoded in env)
     if (allowlist.includes(ip)) {
-        // ... allowlist logic
-        await IpLog.findOneAndUpdate(
-            { userId: user._id, ip },
-            { $set: { status: 'active', lastActive: new Date() }, $setOnInsert: { country: 'Unknown' } },
-            { upsert: true }
-        );
+        return { allowed: true };
+    }
+
+    // 2. Check if IP is whitelisted in DB
+    const existingLog = await IpLog.findOne({ ip, userId: user._id });
+    if (existingLog && existingLog.status === 'whitelisted') {
         return { allowed: true };
     }
 
@@ -113,6 +114,12 @@ const ensureIpAllowed = async (req, user) => {
             status: { $in: ['active', 'blocked'] }
         });
         if (conflict) {
+            // Also check if the conflict IP is whitelisted (whitelisted IPs shouldn't cause conflicts?)
+            // Actually, if an IP is whitelisted, we should allow it regardless of other users.
+            if (conflict.status === 'whitelisted') {
+                return { allowed: true };
+            }
+
             await IpLog.findOneAndUpdate(
                 { userId: user._id, ip },
                 { $set: { status: 'blocked', blockReason: 'DUPLICATE_IP' } },
@@ -165,7 +172,8 @@ const registerUser = async (req, res) => {
 
 const loginUser = async (req, res) => {
     try {
-        const { username, password } = req.body;
+        let { username, password } = req.body;
+        username = username.toUpperCase();
 
         // 1. Check User collection
         let user = await User.findOne({ username });
@@ -220,7 +228,8 @@ const loginAdmin = async (req, res) => {
 
 const loginAgent = async (req, res) => {
     try {
-        const { username, password } = req.body;
+        let { username, password } = req.body;
+        username = username.toUpperCase();
         const user = await Agent.findOne({ username }); // Query Agent model
         if (!user || !(await user.comparePassword(password))) {
             return res.status(401).json({ message: 'Invalid agent credentials' });

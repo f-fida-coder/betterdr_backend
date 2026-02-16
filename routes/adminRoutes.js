@@ -76,7 +76,10 @@ const {
 	resetUserPassword,
 	resetAgentPassword,
 	impersonateUser,
-	fetchOddsManual
+	fetchOddsManual,
+	updateUserFreeplay,
+	whitelistIp,
+	getAgentTree
 } = require('../controllers/adminController');
 const { protect } = require('../middleware/authMiddleware');
 const { adminOnly, adminOrAgent } = require('../middleware/roleMiddleware');
@@ -122,6 +125,7 @@ router.get('/agent-performance', protect, adminOnly, getAgentPerformance);
 router.get('/ip-tracker', protect, adminOnly, getIpTracker);
 router.post('/ip-tracker/:id/block', protect, adminOnly, blockIp);
 router.post('/ip-tracker/:id/unblock', protect, adminOnly, unblockIp);
+router.post('/ip-tracker/:id/whitelist', protect, adminOnly, whitelistIp);
 router.get('/transactions', protect, adminOnly, getTransactionsHistory);
 router.get('/collections', protect, adminOnly, getCollections);
 router.post('/collections', protect, adminOnly, createCollection);
@@ -160,6 +164,7 @@ router.delete('/manual/:id', protect, adminOnly, deleteManualSection);
 
 // Password Reset Routes
 router.post('/users/:id/reset-password', protect, adminOrAgent, resetUserPassword);
+router.put('/users/:id/freeplay', protect, adminOrAgent, updateUserFreeplay);
 router.post('/agents/:id/reset-password', protect, adminOnly, resetAgentPassword);
 
 // User Statistics Route
@@ -169,5 +174,8 @@ router.get('/next-username/:prefix', protect, adminOrAgent, getNextUsername);
 
 // Impersonation Route
 router.post('/impersonate-user/:id', protect, adminOrAgent, impersonateUser);
+
+// Agent Tree Route
+router.get('/agent-tree', protect, adminOrAgent, getAgentTree);
 
 module.exports = router;

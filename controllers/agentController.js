@@ -15,13 +15,14 @@ exports.createUser = async (req, res) => {
             maxBet,
             creditLimit,
             balanceOwed,
+            freeplayBalance,
             apps
         } = req.body;
         const agentId = req.user._id;
 
-        // Ensure only regular agents (sub-agents) can create users
-        if (req.user.role !== 'agent') {
-            return res.status(403).json({ message: 'Only Agents (Sub-Agents) can create customers' });
+        // Ensure agents or super agents can create users
+        if (req.user.role !== 'agent' && req.user.role !== 'super_agent') {
+            return res.status(403).json({ message: 'Only Agents or Super Agents can create customers' });
         }
 
         // Validation
@@ -60,20 +61,21 @@ exports.createUser = async (req, res) => {
 
         // Create user assigned to this agent
         const newUser = new User({
-            username,
+            username: username.toUpperCase(),
             phoneNumber,
             password,
             rawPassword: password,
-            firstName,
-            lastName,
-            fullName: fullName || `${firstName || ''} ${lastName || ''}`.trim() || username,
+            firstName: (firstName || '').toUpperCase(),
+            lastName: (lastName || '').toUpperCase(),
+            fullName: (fullName || `${firstName || ''} ${lastName || ''}`.trim() || username).toUpperCase(),
             role: 'user',
             status: 'active',
             balance: balance != null ? balance : 1000,
-            minBet: minBet != null ? minBet : 1,
-            maxBet: maxBet != null ? maxBet : 5000,
-            creditLimit: creditLimit != null ? creditLimit : 1000,
-            balanceOwed: balanceOwed != null ? balanceOwed : 0,
+            minBet: minBet != null ? minBet : (req.user.defaultMinBet || 25),
+            maxBet: maxBet != null ? maxBet : (req.user.defaultMaxBet || 200),
+            creditLimit: creditLimit != null ? creditLimit : (req.user.defaultCreditLimit || 1000),
+            balanceOwed: balanceOwed != null ? balanceOwed : (req.user.defaultSettleLimit || 0),
+            freeplayBalance: freeplayBalance != null ? freeplayBalance : 200,
             pendingBalance: 0,
             agentId: agentId,
             createdBy: agentId,
@@ -104,7 +106,7 @@ exports.getMyUsers = async (req, res) => {
     try {
         const agentId = req.user._id;
 
-        const users = await User.find({ agentId }).select('username firstName lastName fullName phoneNumber balance pendingBalance balanceOwed creditLimit minBet maxBet status createdAt totalWinnings rawPassword');
+        const users = await User.find({ agentId }).select('username firstName lastName fullName phoneNumber balance pendingBalance balanceOwed freeplayBalance creditLimit minBet maxBet status createdAt totalWinnings rawPassword');
         // Calculate active status (>= 2 bets in last 7 days)
         const oneWeekAgo = new Date();
         oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
@@ -131,6 +133,7 @@ exports.getMyUsers = async (req, res) => {
                 maxBet: user.maxBet,
                 creditLimit: parseFloat(user.creditLimit?.toString() || '0'),
                 balanceOwed: parseFloat(user.balanceOwed?.toString() || '0'),
+                freeplayBalance: parseFloat(user.freeplayBalance?.toString() || '0'),
                 status: user.status,
                 createdAt: user.createdAt,
                 totalWinnings: user.totalWinnings,
@@ -302,20 +305,21 @@ exports.updateCustomer = async (req, res) => {
             user.password = password;
             user.rawPassword = password;
         }
-        if (firstName) user.firstName = firstName;
-        if (lastName) user.lastName = lastName;
+        if (firstName) user.firstName = firstName.toUpperCase();
+        if (lastName) user.lastName = lastName.toUpperCase();
         if (fullName) {
-            user.fullName = fullName;
+            user.fullName = fullName.toUpperCase();
         } else if (firstName || lastName) {
-            const fName = firstName || user.firstName || '';
-            const lName = lastName || user.lastName || '';
-            user.fullName = `${fName} ${lName}`.trim();
+            const fName = (firstName || user.firstName || '').toUpperCase();
+            const lName = (lastName || user.lastName || '').toUpperCase();
+            user.fullName = `${fName} ${lName}`.trim().toUpperCase();
         }
 
         if (minBet !== undefined) user.minBet = minBet;
         if (maxBet !== undefined) user.maxBet = maxBet;
         if (creditLimit !== undefined) user.creditLimit = creditLimit;
         if (balanceOwed !== undefined) user.balanceOwed = balanceOwed;
+        if (freeplayBalance !== undefined) user.freeplayBalance = freeplayBalance;
         if (apps !== undefined) user.apps = { ...user.apps, ...apps };
         if (req.body.status) user.status = req.body.status;
 
@@ -351,12 +355,12 @@ exports.getMySubAgents = async (req, res) => {
 // Create Sub-Agent
 exports.createSubAgent = async (req, res) => {
     try {
-        const { username, phoneNumber, password, fullName } = req.body;
+        const { username, phoneNumber, password, fullName, defaultMinBet, defaultMaxBet, defaultCreditLimit, defaultSettleLimit } = req.body;
         const creator = req.user;
 
         // Only super_agent can create sub-agents
         if (creator.role !== 'super_agent') {
-            return res.status(403).json({ message: 'Only Super Agents can create sub-agents' });
+            return res.status(403).json({ message: 'Only Super Agents can create agents' });
         }
 
         // Validation
@@ -377,15 +381,19 @@ exports.createSubAgent = async (req, res) => {
 
         // Create sub-agent
         const newAgent = new Agent({
-            username,
+            username: username.toUpperCase(),
             phoneNumber,
             password,
-            fullName: fullName || username,
+            fullName: (fullName || username).toUpperCase(),
             role: 'agent',
             status: 'active',
             balance: 0.00,
             agentBillingRate: creator.agentBillingRate || 0.00,
             agentBillingStatus: 'paid',
+            defaultMinBet: defaultMinBet != null ? defaultMinBet : 25,
+            defaultMaxBet: defaultMaxBet != null ? defaultMaxBet : 200,
+            defaultCreditLimit: defaultCreditLimit != null ? defaultCreditLimit : 1000,
+            defaultSettleLimit: defaultSettleLimit != null ? defaultSettleLimit : 0,
             createdBy: creator._id,
             createdByModel: 'Agent'
         });

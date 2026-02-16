@@ -11,6 +11,7 @@ const createAdmin = async () => {
             username: 'fida',
             email: 'fida@example.com',
             password: 'Fida47',
+            phoneNumber: '1234567890', // Dummy phone number for seed
             role: 'admin',
             status: 'active',
             isSuperAdmin: true,

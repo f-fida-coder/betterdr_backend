@@ -31,7 +31,7 @@ const ipLogSchema = new mongoose.Schema(
         },
         status: {
             type: String,
-            enum: ['active', 'blocked'],
+            enum: ['active', 'blocked', 'whitelisted'],
             default: 'active',
             index: true,
         },

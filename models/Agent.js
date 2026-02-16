@@ -55,6 +55,24 @@ const agentSchema = new mongoose.Schema(
             default: null,
         },
 
+        // Default betting limits for players created under this agent
+        defaultMinBet: {
+            type: Number,
+            default: 25,
+        },
+        defaultMaxBet: {
+            type: Number,
+            default: 200,
+        },
+        defaultCreditLimit: {
+            type: Number,
+            default: 1000,
+        },
+        defaultSettleLimit: {
+            type: Number,
+            default: 0,
+        },
+
         role: {
             type: String,
             enum: ['agent', 'super_agent'],

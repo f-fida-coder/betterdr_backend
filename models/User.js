@@ -136,6 +136,11 @@ const userSchema = new mongoose.Schema(
             btc: { type: String, default: '' },
             other: { type: String, default: '' }
         },
+        freeplayBalance: {
+            type: mongoose.Decimal128,
+            default: 200.00,
+            get: (value) => value ? value.toString() : '0.00',
+        },
     },
     {
         timestamps: true,

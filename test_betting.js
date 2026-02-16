@@ -36,7 +36,7 @@ function request(url, method, body, headers = {}) {
     });
 }
 
-const BASE_URL = 'http://localhost:5000/api';
+const BASE_URL = 'https://betterdr-backend.onrender.com/api';
 
 async function runTest() {
     try {

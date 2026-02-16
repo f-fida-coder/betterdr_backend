@@ -45,13 +45,13 @@ app.use('/api/debug', require('./routes/debugRoutes'));
 app.use('/api/messages', require('./routes/messageRoutes'));
 
 // Serve static files from the React app
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname, '../dist')));
 
 // The "catchall" handler: for any request that doesn't
 // match one above, send back React's index.html file.
 app.use((req, res, next) => {
     if (req.method === 'GET' && !req.path.startsWith('/api')) {
-        return res.sendFile(path.join(__dirname, 'public', 'index.html'));
+        return res.sendFile(path.join(__dirname, '../dist', 'index.html'));
     }
     next();
 });

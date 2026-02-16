@@ -3,7 +3,7 @@ const fetch = require('node-fetch');
 // Assuming native fetch or we'll install node-fetch.
 // Let's try native fetch first (Node 18+).
 
-const BASE_URL = 'http://localhost:5000/api';
+const BASE_URL = 'https://betterdr-backend.onrender.com/api';
 let token = '';
 let matchId = '';
 

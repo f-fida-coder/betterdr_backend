@@ -1,6 +1,6 @@
 const io = require('socket.io-client');
 
-const socket = io('http://localhost:5000');
+const socket = io('https://betterdr-backend.onrender.com');
 
 console.log('--- Client connecting to socket ---');
 

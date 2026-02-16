@@ -54,6 +54,9 @@ const protect = async (req, res, next) => {
                     if (existingIp && existingIp.status === 'blocked') {
                         return res.status(403).json({ message: 'Access blocked for this IP address' });
                     }
+                    if (existingIp && existingIp.status === 'whitelisted') {
+                        // Skip further tracking or just update lastActive
+                    }
                 }
 
                 await IpLog.findOneAndUpdate(

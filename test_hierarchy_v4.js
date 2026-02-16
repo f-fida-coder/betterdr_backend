@@ -1,7 +1,7 @@
 const axios = require('axios');
 const mongoose = require('mongoose');
 
-const API_URL = 'http://localhost:5000/api';
+const API_URL = 'https://betterdr-backend.onrender.com/api';
 
 // Helper to print step headers
 const printStep = (step, title) => {

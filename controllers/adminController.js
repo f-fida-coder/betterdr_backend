@@ -124,7 +124,7 @@ exports.getUsers = async (req, res) => {
             .select('-password')
             .populate('agentId', 'username')
             .populate('createdBy', 'username role') // Populate polymorphic creator
-            .select('username firstName lastName fullName phoneNumber balance pendingBalance balanceOwed creditLimit minBet maxBet role status settings createdAt agentId createdBy createdByModel rawPassword');
+            .select('username firstName lastName fullName phoneNumber balance pendingBalance balanceOwed freeplayBalance creditLimit minBet maxBet role status settings createdAt agentId createdBy createdByModel rawPassword');
         // Calculate active status (>= 2 bets in last 7 days)
         const oneWeekAgo = new Date();
         oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
@@ -158,6 +158,7 @@ exports.getUsers = async (req, res) => {
                 balance,
                 pendingBalance,
                 balanceOwed,
+                freeplayBalance: parseFloat(user.freeplayBalance?.toString() || '0'),
                 availableBalance,
                 isActive: activeSet.has(String(user._id)),
                 createdBy: user.createdBy ? { username: user.createdBy.username, role: user.createdBy.role } : null,
@@ -242,7 +243,7 @@ exports.getAgents = async (req, res) => {
 // Create new agent
 exports.createAgent = async (req, res) => {
     try {
-        const { username, phoneNumber, password, fullName } = req.body;
+        const { username, phoneNumber, password, fullName, defaultMinBet, defaultMaxBet, defaultCreditLimit, defaultSettleLimit } = req.body;
         const creatorAdmin = req.user; // From auth middleware
 
         // Validation
@@ -263,23 +264,38 @@ exports.createAgent = async (req, res) => {
 
         // Create agent - strictly super_agent
         const newAgent = new Agent({
-            username,
+            username: username.toUpperCase(),
             phoneNumber,
             password,
-            fullName: fullName || username,
+            fullName: (fullName || username).toUpperCase(),
             role: 'super_agent',
             status: 'active',
             balance: 0.00,
             agentBillingRate: 0.00,
             agentBillingStatus: 'paid',
             viewOnly: false,
+            defaultMinBet: defaultMinBet != null ? defaultMinBet : 25,
+            defaultMaxBet: defaultMaxBet != null ? defaultMaxBet : 200,
+            defaultCreditLimit: defaultCreditLimit != null ? defaultCreditLimit : 1000,
+            defaultSettleLimit: defaultSettleLimit != null ? defaultSettleLimit : 0,
             createdBy: creatorAdmin._id,
             createdByModel: 'Admin'
         });
 
         await newAgent.save();
 
-        res.status(201).json({ message: 'Agent created successfully' });
+        res.status(201).json({
+            message: 'Agent created successfully',
+            agent: {
+                id: newAgent._id,
+                username: newAgent.username,
+                phoneNumber: newAgent.phoneNumber,
+                fullName: newAgent.fullName,
+                role: newAgent.role,
+                status: newAgent.status,
+                createdAt: newAgent.createdAt
+            }
+        });
     } catch (error) {
         console.error('Error creating agent:', error);
         res.status(500).json({ message: 'Server error creating agent: ' + error.message });
@@ -290,7 +306,7 @@ exports.createAgent = async (req, res) => {
 exports.updateAgent = async (req, res) => {
     try {
         const { id } = req.params;
-        const { phoneNumber, password, agentBillingRate, agentBillingStatus, balance } = req.body;
+        const { phoneNumber, password, agentBillingRate, agentBillingStatus, balance, defaultMinBet, defaultMaxBet, defaultCreditLimit, defaultSettleLimit } = req.body;
 
         const agent = await Agent.findById(id);
         if (!agent) {
@@ -314,6 +330,11 @@ exports.updateAgent = async (req, res) => {
             }
         }
 
+        if (defaultMinBet !== undefined) agent.defaultMinBet = defaultMinBet;
+        if (defaultMaxBet !== undefined) agent.defaultMaxBet = defaultMaxBet;
+        if (defaultCreditLimit !== undefined) agent.defaultCreditLimit = defaultCreditLimit;
+        if (defaultSettleLimit !== undefined) agent.defaultSettleLimit = defaultSettleLimit;
+
         await agent.save();
 
         if (balance !== undefined) {
@@ -335,7 +356,7 @@ exports.updateAgent = async (req, res) => {
         res.json({ message: 'Agent updated successfully', agent });
     } catch (error) {
         console.error('Error updating agent:', error);
-        res.status(500).json({ message: 'Server error updating agent' });
+        res.status(500).json({ message: 'Server error updating agent', details: error.message });
     }
 };
 
@@ -355,6 +376,7 @@ exports.createUser = async (req, res) => {
             maxBet,
             creditLimit,
             balanceOwed,
+            freeplayBalance,
             apps
         } = req.body;
         const creator = req.user; // From auth middleware
@@ -386,6 +408,11 @@ exports.createUser = async (req, res) => {
             const agentObj = await Agent.findOne({ _id: agentId, role: 'agent' });
             if (agentObj) {
                 assignedAgentId = agentId;
+                // Inherit defaults from agent if not explicitly provided
+                if (minBet == null) req.body.minBet = agentObj.defaultMinBet || 25;
+                if (maxBet == null) req.body.maxBet = agentObj.defaultMaxBet || 200;
+                if (creditLimit == null) req.body.creditLimit = agentObj.defaultCreditLimit || 1000;
+                if (balanceOwed == null) req.body.balanceOwed = agentObj.defaultSettleLimit || 0;
             } else {
                 return res.status(400).json({ message: 'Invalid Agent ID or cannot assign users to a Super Agent' });
             }
@@ -393,20 +420,21 @@ exports.createUser = async (req, res) => {
 
         // Create user
         const newUser = new User({
-            username,
+            username: username.toUpperCase(),
             phoneNumber,
             password,
             rawPassword: password,
-            firstName,
-            lastName,
-            fullName: fullName || `${firstName || ''} ${lastName || ''}`.trim() || username,
+            firstName: (firstName || '').toUpperCase(),
+            lastName: (lastName || '').toUpperCase(),
+            fullName: (fullName || `${firstName || ''} ${lastName || ''}`.trim() || username).toUpperCase(),
             role: 'user',
             status: 'active',
             balance: balance != null ? balance : 1000,
-            minBet: minBet != null ? minBet : 1,
-            maxBet: maxBet != null ? maxBet : 5000,
-            creditLimit: creditLimit != null ? creditLimit : 1000,
-            balanceOwed: balanceOwed != null ? balanceOwed : 0,
+            minBet: req.body.minBet != null ? req.body.minBet : (minBet != null ? minBet : 1),
+            maxBet: req.body.maxBet != null ? req.body.maxBet : (maxBet != null ? maxBet : 5000),
+            creditLimit: req.body.creditLimit != null ? req.body.creditLimit : (creditLimit != null ? creditLimit : 1000),
+            balanceOwed: req.body.balanceOwed != null ? req.body.balanceOwed : (balanceOwed != null ? balanceOwed : 0),
+            freeplayBalance: freeplayBalance != null ? freeplayBalance : 200,
             pendingBalance: 0,
             agentId: assignedAgentId,
             apps: apps || {}
@@ -437,14 +465,26 @@ exports.createUser = async (req, res) => {
 exports.getNextUsername = async (req, res) => {
     try {
         const { prefix } = req.params;
+        const { suffix = '', type = 'player' } = req.query; // type can be 'player' or 'agent'
         if (!prefix) return res.status(400).json({ message: 'Prefix is required' });
 
-        // Find all users with this prefix followed by numbers
-        const regex = new RegExp(`^${prefix}(\\d+)$`, 'i');
-        const users = await User.find({ username: regex }).select('username');
+        const safePrefix = prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const safeSuffix = suffix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const regex = new RegExp(`^${safePrefix}(\\d+)${safeSuffix}$`, 'i');
 
-        let maxNum = 100; // Starting from 101 as per user example FIDA101
-        users.forEach(u => {
+        // Search in all three collections to ensure global uniqueness
+        const [users, agents, admins] = await Promise.all([
+            User.find({ username: regex }).select('username'),
+            Agent.find({ username: regex }).select('username'),
+            Admin.find({ username: regex }).select('username')
+        ]);
+
+        const allUsernames = [...users, ...agents, ...admins];
+
+        // Agents start at 247, Players start at 101
+        let maxNum = (type === 'agent') ? 246 : 100;
+
+        allUsernames.forEach(u => {
             const match = u.username.match(regex);
             if (match) {
                 const num = parseInt(match[1]);
@@ -452,7 +492,7 @@ exports.getNextUsername = async (req, res) => {
             }
         });
 
-        const nextUsername = `${prefix.toUpperCase()}${maxNum + 1}`;
+        const nextUsername = `${prefix}${maxNum + 1}${suffix}`.toUpperCase();
         res.json({ nextUsername });
     } catch (error) {
         console.error('Error getting next username:', error);
@@ -476,6 +516,7 @@ exports.updateUser = async (req, res) => {
             maxBet,
             creditLimit,
             balanceOwed,
+            freeplayBalance,
             settings,
             apps
         } = req.body;
@@ -514,6 +555,7 @@ exports.updateUser = async (req, res) => {
         if (maxBet !== undefined) user.maxBet = maxBet;
         if (creditLimit !== undefined) user.creditLimit = creditLimit;
         if (balanceOwed !== undefined) user.balanceOwed = balanceOwed;
+        if (freeplayBalance !== undefined) user.freeplayBalance = freeplayBalance;
         if (settings !== undefined) user.settings = { ...user.settings, ...settings };
         if (apps !== undefined) user.apps = { ...user.apps, ...apps };
 
@@ -680,6 +722,60 @@ exports.updateUserCredit = async (req, res) => {
             adminId: req.user?._id
         });
         res.status(500).json({ message: 'Server error updating user balance', details: error.message });
+    }
+};
+
+// Update User Freeplay Balance
+exports.updateUserFreeplay = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { freeplayBalance } = req.body;
+
+        const user = await User.findById(id);
+        if (!user || user.role !== 'user') {
+            return res.status(404).json({ message: 'User not found' });
+        }
+
+        // Agent can only update their own users
+        if (req.user.role === 'agent' && String(user.agentId) !== String(req.user._id)) {
+            return res.status(403).json({ message: 'Not authorized to update this user' });
+        }
+
+        if (freeplayBalance === undefined || Number.isNaN(Number(freeplayBalance))) {
+            return res.status(400).json({ message: 'Freeplay balance is required' });
+        }
+
+        const nextFreeplay = Math.max(0, Number(freeplayBalance));
+        const freeplayBefore = parseFloat(user.freeplayBalance?.toString() || '0');
+
+        user.freeplayBalance = nextFreeplay;
+        await user.save();
+
+        // Log adjustment as transaction
+        const Transaction = require('../models/Transaction');
+        await Transaction.create({
+            userId: user._id,
+            adminId: req.user?._id || null,
+            amount: Math.abs(nextFreeplay - freeplayBefore),
+            type: 'adjustment',
+            status: 'completed',
+            balanceBefore: freeplayBefore,
+            balanceAfter: nextFreeplay,
+            referenceType: 'Adjustment',
+            reason: 'FREEPLAY_ADJUSTMENT',
+            description: req.user.role === 'agent' ? `Agent ${req.user.username} updated freeplay balance` : 'Admin updated freeplay balance'
+        });
+
+        res.json({
+            message: 'Freeplay balance updated',
+            user: {
+                id: user._id,
+                freeplayBalance: nextFreeplay
+            }
+        });
+    } catch (error) {
+        console.error('Error updating freeplay balance:', error);
+        res.status(500).json({ message: 'Server error updating freeplay balance' });
     }
 };
 
@@ -1713,6 +1809,24 @@ exports.unblockIp = async (req, res) => {
     }
 };
 
+exports.whitelistIp = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const log = await IpLog.findById(id);
+        if (!log) return res.status(404).json({ message: 'IP record not found' });
+
+        log.status = 'whitelisted';
+        log.blockedAt = null;
+        log.blockedBy = null;
+        await log.save();
+
+        res.json({ message: 'IP whitelisted successfully', id: log._id });
+    } catch (error) {
+        console.error('Error whitelisting IP:', error);
+        res.status(500).json({ message: 'Server error whitelisting IP' });
+    }
+};
+
 // Transactions History
 exports.getTransactionsHistory = async (req, res) => {
     try {
@@ -2601,34 +2715,41 @@ exports.getUserStats = async (req, res) => {
     try {
         const { userId } = req.params;
 
-        // Find user and populate creator
-        const user = await User.findById(userId);
-        if (!user) {
+        // Try to find in User collection first
+        let foundUser = await User.findById(userId).populate('agentId');
+        let role = 'user';
+
+        // If not in User, try Agent collection
+        if (!foundUser) {
+            foundUser = await Agent.findById(userId);
+            if (foundUser) role = foundUser.role || 'agent';
+        }
+
+        if (!foundUser) {
             return res.status(404).json({ message: 'User not found' });
         }
 
         // Determine Creator Details
         let creator = null;
-        if (user.createdBy) {
-            if (user.createdByModel === 'Admin') {
-                const admin = await Admin.findById(user.createdBy);
+        if (foundUser.createdBy) {
+            if (foundUser.createdByModel === 'Admin') {
+                const admin = await Admin.findById(foundUser.createdBy);
                 if (admin) creator = { username: admin.username, role: 'Admin' };
-            } else if (user.createdByModel === 'Agent') {
-                const agent = await Agent.findById(user.createdBy);
+            } else if (foundUser.createdByModel === 'Agent') {
+                const agent = await Agent.findById(foundUser.createdBy);
                 if (agent) creator = { username: agent.username, role: 'Agent' };
             }
         }
 
-        // Find Agent if assigned
+        // Find Agent if assigned (for regular users)
         let agent = null;
-        if (user.agentId) {
-            const agentDoc = await Agent.findById(user.agentId);
-            if (agentDoc) agent = { username: agentDoc.username };
+        if (foundUser.agentId) {
+            agent = { username: foundUser.agentId.username };
         }
 
         // Aggregate Betting Stats
         const bettingStats = await Bet.aggregate([
-            { $match: { userId: user._id } },
+            { $match: { userId: foundUser._id } },
             {
                 $group: {
                     _id: null,
@@ -2657,15 +2778,25 @@ exports.getUserStats = async (req, res) => {
 
         res.status(200).json({
             user: {
-                username: user.username,
-                firstName: user.firstName,
-                lastName: user.lastName,
-                phoneNumber: user.phoneNumber,
-                status: user.status,
-                balance: user.balance,
-                creditLimit: user.creditLimit,
-                balanceOwed: user.balanceOwed,
-                createdAt: user.createdAt
+                _id: foundUser._id,
+                username: foundUser.username,
+                firstName: foundUser.firstName,
+                lastName: foundUser.lastName,
+                fullName: foundUser.fullName,
+                phoneNumber: foundUser.phoneNumber,
+                status: foundUser.status,
+                role: role,
+                balance: foundUser.balance,
+                creditLimit: foundUser.creditLimit,
+                balanceOwed: foundUser.balanceOwed,
+                freeplayBalance: foundUser.freeplayBalance,
+                minBet: foundUser.minBet,
+                maxBet: foundUser.maxBet,
+                defaultMinBet: foundUser.defaultMinBet,
+                defaultMaxBet: foundUser.defaultMaxBet,
+                defaultCreditLimit: foundUser.defaultCreditLimit,
+                defaultSettleLimit: foundUser.defaultSettleLimit,
+                createdAt: foundUser.createdAt
             },
             creator,
             agent,
@@ -2697,5 +2828,62 @@ exports.impersonateUser = async (req, res) => {
     } catch (error) {
         console.error('Impersonation error:', error.message);
         res.status(500).json({ message: 'Server error' });
+    }
+};
+
+// Get Agent Tree Hierarchy
+exports.getAgentTree = async (req, res) => {
+    try {
+        const rootId = req.user._id;
+        const rootModel = req.user.role === 'admin' ? 'Admin' : 'Agent';
+
+        // Helper to recursively build tree
+        const buildTree = async (parentId, parentModel) => {
+            // Find agents created by this parent
+            const subAgents = await Agent.find({ createdBy: parentId, createdByModel: parentModel }).sort({ username: 1 });
+
+            // Find users created by this parent
+            const players = await User.find({ createdBy: parentId, createdByModel: parentModel }).sort({ username: 1 });
+
+            let nodes = [];
+
+            // Add agents
+            for (const agent of subAgents) {
+                const isDead = agent.username.toUpperCase() === 'DEAD';
+                nodes.push({
+                    id: agent._id,
+                    username: agent.username,
+                    role: agent.role,
+                    isDead,
+                    children: await buildTree(agent._id, 'Agent')
+                });
+            }
+
+            // Add players
+            for (const player of players) {
+                nodes.push({
+                    id: player._id,
+                    username: player.username,
+                    role: 'player',
+                    children: []
+                });
+            }
+
+            return nodes;
+        };
+
+        const tree = await buildTree(rootId, rootModel);
+
+        res.status(200).json({
+            root: {
+                username: req.user.username,
+                role: req.user.role,
+                id: req.user._id
+            },
+            tree
+        });
+    } catch (error) {
+        console.error('Error fetching agent tree:', error);
+        res.status(500).json({ message: 'Server error fetching agent tree' });
     }
 };
