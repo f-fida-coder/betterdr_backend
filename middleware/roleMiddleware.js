@@ -1,9 +1,9 @@
 const adminOnly = (req, res, next) => {
-    const authorizedRoles = ['admin', 'super_agent', 'agent'];
+    const authorizedRoles = ['admin', 'super_agent', 'master_agent'];
     if (req.user && authorizedRoles.includes(req.user.role)) {
         next();
     } else {
-        res.status(403).json({ message: 'Not authorized as admin, super agent or agent' });
+        res.status(403).json({ message: 'Not authorized as admin or master agent' });
     }
 };
 
@@ -16,7 +16,7 @@ const agentOnly = (req, res, next) => {
 };
 
 const adminOrAgent = (req, res, next) => {
-    const roles = ['admin', 'super_agent', 'agent'];
+    const roles = ['admin', 'super_agent', 'master_agent', 'agent'];
     if (req.user && roles.includes(req.user.role)) {
         next();
     } else {

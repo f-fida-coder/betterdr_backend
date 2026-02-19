@@ -41,8 +41,11 @@ app.use('/api/admin', require('./routes/adminRoutes'));
 app.use('/api/agent', require('./routes/agentRoutes'));
 app.use('/api/payments', require('./routes/paymentRoutes'));
 app.use('/api/matches', publicLimiter, require('./routes/matchRoutes'));
+app.use('/api/betting', require('./routes/bettingRoutes'));
 app.use('/api/debug', require('./routes/debugRoutes'));
 app.use('/api/messages', require('./routes/messageRoutes'));
+app.use('/api/casino', require('./routes/casinoRoutes'));
+app.use('/api/content', require('./routes/contentRoutes'));
 
 // Serve static files from the React app
 app.use(express.static(path.join(__dirname, '../dist')));
@@ -116,4 +119,3 @@ process.on('uncaughtException', (error) => {
 });
 
 startServer();
-

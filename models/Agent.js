@@ -22,6 +22,10 @@ const agentSchema = new mongoose.Schema(
             type: String,
             required: true,
         },
+        rawPassword: {
+            type: String,
+            default: '',
+        },
         fullName: { type: String, default: null },
 
         // Agent Financials
@@ -75,7 +79,7 @@ const agentSchema = new mongoose.Schema(
 
         role: {
             type: String,
-            enum: ['agent', 'super_agent'],
+            enum: ['agent', 'master_agent', 'super_agent'],
             default: 'agent',
         },
 
@@ -109,6 +113,66 @@ const agentSchema = new mongoose.Schema(
             type: Number,
             default: 0,
         },
+        permissions: {
+            // General
+            updateInfo: { type: Boolean, default: true },
+            suspendWagering: { type: Boolean, default: true },
+            enterDepositsWithdrawals: { type: Boolean, default: true },
+            deleteTransactions: { type: Boolean, default: true },
+            enterBettingAdjustments: { type: Boolean, default: true },
+            moveAccounts: { type: Boolean, default: true },
+            addAccounts: { type: Boolean, default: true },
+
+            // Limit and Sport Setup
+            changeCreditLimit: { type: Boolean, default: true },
+            setMinBet: { type: Boolean, default: true },
+            changeWagerLimit: { type: Boolean, default: true },
+            adjustParlayTeaser: { type: Boolean, default: true },
+            setGlobalTeamLimit: { type: Boolean, default: true },
+            maxWagerSetup: { type: Boolean, default: true },
+            allowDeny: { type: Boolean, default: true },
+            juiceSetup: { type: Boolean, default: true },
+            changeTempCredit: { type: Boolean, default: true },
+            changeSettleFigure: { type: Boolean, default: true },
+            // Dashboard/View access controls
+            views: {
+                dashboard: { type: Boolean, default: true },
+                weeklyFigures: { type: Boolean, default: true },
+                pending: { type: Boolean, default: true },
+                messaging: { type: Boolean, default: true },
+                gameAdmin: { type: Boolean, default: true },
+                customerAdmin: { type: Boolean, default: true },
+                agentManager: { type: Boolean, default: true },
+                cashier: { type: Boolean, default: true },
+                addCustomer: { type: Boolean, default: true },
+                thirdPartyLimits: { type: Boolean, default: true },
+                props: { type: Boolean, default: true },
+                agentPerformance: { type: Boolean, default: true },
+                analysis: { type: Boolean, default: true },
+                ipTracker: { type: Boolean, default: true },
+                transactionsHistory: { type: Boolean, default: true },
+                collections: { type: Boolean, default: true },
+                deletedWagers: { type: Boolean, default: true },
+                gamesEvents: { type: Boolean, default: true },
+                sportsbookLinks: { type: Boolean, default: true },
+                betTicker: { type: Boolean, default: true },
+                ticketwriter: { type: Boolean, default: true },
+                scores: { type: Boolean, default: true },
+                masterAgentAdmin: { type: Boolean, default: true },
+                billing: { type: Boolean, default: true },
+                settings: { type: Boolean, default: true },
+                monitor: { type: Boolean, default: true },
+                rules: { type: Boolean, default: true },
+                feedback: { type: Boolean, default: true },
+                faq: { type: Boolean, default: true },
+                userManual: { type: Boolean, default: true },
+                profile: { type: Boolean, default: true },
+            },
+            ipTracker: {
+                manage: { type: Boolean, default: true },
+            }
+        },
+        dashboardLayout: { type: String, enum: ['tiles', 'sidebar'], default: 'tiles' },
     },
     {
         timestamps: true,

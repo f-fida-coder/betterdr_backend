@@ -97,6 +97,28 @@ const userSchema = new mongoose.Schema(
             enum: ['Admin', 'Agent', 'User'], // Allow User for self-registration if needed
             default: null
         },
+        referredByUserId: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: 'User',
+            default: null,
+            index: true,
+        },
+        referralBonusGranted: {
+            type: Boolean,
+            default: false,
+        },
+        referralBonusGrantedAt: {
+            type: Date,
+            default: null,
+        },
+        referralQualifiedDepositAt: {
+            type: Date,
+            default: null,
+        },
+        referralBonusAmount: {
+            type: Number,
+            default: 0,
+        },
         isVerified: {
             type: Boolean,
             default: false,

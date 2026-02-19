@@ -40,6 +40,8 @@ const adminSchema = new mongoose.Schema(
             enum: ['active', 'suspended'],
             default: 'active',
         },
+        viewOnly: { type: Boolean, default: false },
+        dashboardLayout: { type: String, enum: ['tiles', 'sidebar'], default: 'tiles' },
 
         fullName: { type: String, default: null },
     },

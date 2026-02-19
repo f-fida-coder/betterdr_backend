@@ -1,5 +1,6 @@
-const { Bet, User, Match } = require('../models');
+const { Bet, User, Match, BetModeRule } = require('../models');
 const mongoose = require('mongoose');
+const { normalizeBetMode, getDefaultBetModeRule } = require('../config/betModeRules');
 
 const transactionsEnabled = () => String(process.env.MONGODB_TRANSACTIONS_ENABLED || 'false').toLowerCase() === 'true';
 const withSession = (query, session) => (session ? query.session(session) : query);
@@ -27,6 +28,23 @@ const runWithOptionalTransaction = async (work) => {
     }
 };
 
+const getModeRule = async (mode, session) => {
+    const normalizedMode = normalizeBetMode(mode);
+    const dbRule = await withSession(BetModeRule.findOne({ mode: normalizedMode, isActive: true }), session);
+    if (dbRule) return dbRule.toObject ? dbRule.toObject() : dbRule;
+    return getDefaultBetModeRule(normalizedMode);
+};
+
+const getTeaserMultiplier = (rule, legCount) => {
+    const multipliers = rule?.payoutProfile?.multipliers || {};
+    const key = String(legCount);
+    if (multipliers[key] !== undefined) {
+        const parsed = Number(multipliers[key]);
+        if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    }
+    return 1;
+};
+
 // Place a Bet
 // Place a Bet
 // Place a Bet
@@ -44,7 +62,7 @@ const validateSelection = async (matchId, selection, odds, type, session) => {
     }
 
     const markets = Array.isArray(match.odds?.markets) ? match.odds.markets : [];
-    const normalizedType = String(type || '').toLowerCase();
+    const normalizedType = normalizeBetMode(type || '');
     const findMarket = (key) => markets.find(m => String(m.key || '').toLowerCase() === key);
 
     let market = findMarket(normalizedType);
@@ -95,7 +113,7 @@ exports.placeBet = async (req, res) => {
         const ipAddress = req.ip || req.connection.remoteAddress;
         const userAgent = req.headers['user-agent'];
 
-        const betType = String(type || 'straight').toLowerCase();
+        const betType = normalizeBetMode(type || 'straight');
         const betAmount = parseFloat(amount);
 
         if (isNaN(betAmount) || betAmount <= 0) {
@@ -104,6 +122,11 @@ exports.placeBet = async (req, res) => {
 
         let createdBets = [];
         await runWithOptionalTransaction(async (session) => {
+            const modeRule = await getModeRule(betType, session);
+            if (!modeRule) {
+                throw new Error(`Bet mode ${betType} is not supported`);
+            }
+
             const user = await withSession(User.findById(userId), session);
             if (!user) throw new Error('User not found');
             if (['suspended', 'disabled', 'read only'].includes(user.status)) {
@@ -124,25 +147,42 @@ exports.placeBet = async (req, res) => {
 
             let totalRisk = betAmount;
             let validatedSelections = [];
+            let selectionInputs = [];
 
-            if (['parlay', 'teaser', 'if_bet', 'reverse'].includes(betType)) {
-                if (!Array.isArray(selections) || selections.length < 2) {
-                    throw new Error(`${betType.toUpperCase()} requires at least 2 selections`);
-                }
-                for (const sel of selections) {
-                    const validated = await validateSelection(sel.matchId, sel.selection, sel.odds, sel.type || 'straight', session);
-                    validatedSelections.push(validated);
-                }
-
-                if (betType === 'reverse') {
-                    // Reverse is basically 2 If-Bets (A->B and B->A)
-                    // Risk is doubled
-                    totalRisk = betAmount * 2;
+            if (betType === 'straight') {
+                if (Array.isArray(selections) && selections.length > 0) {
+                    selectionInputs = [selections[0]];
+                } else if (matchId && selection) {
+                    selectionInputs = [{ matchId, selection, odds, type }];
+                } else {
+                    throw new Error('Straight bet requires one selection');
                 }
             } else {
-                // Straight bet
-                const validated = await validateSelection(matchId, selection, odds, type, session);
+                if (!Array.isArray(selections) || selections.length === 0) {
+                    throw new Error(`${betType.toUpperCase()} requires selections`);
+                }
+                selectionInputs = selections;
+            }
+
+            if (selectionInputs.length < modeRule.minLegs || selectionInputs.length > modeRule.maxLegs) {
+                throw new Error(`${betType.toUpperCase()} requires ${modeRule.minLegs === modeRule.maxLegs ? modeRule.minLegs : `${modeRule.minLegs}-${modeRule.maxLegs}`} selections`);
+            }
+
+            for (const sel of selectionInputs) {
+                const validated = await validateSelection(sel.matchId, sel.selection, sel.odds, sel.type || 'straight', session);
                 validatedSelections.push(validated);
+            }
+
+            if (betType === 'teaser' && Array.isArray(modeRule.teaserPointOptions) && modeRule.teaserPointOptions.length > 0) {
+                const teaserPointValue = Number(teaserPoints || 0);
+                if (!modeRule.teaserPointOptions.includes(teaserPointValue)) {
+                    throw new Error(`Invalid teaser points. Allowed: ${modeRule.teaserPointOptions.join(', ')}`);
+                }
+            }
+
+            if (betType === 'reverse') {
+                // Reverse creates two IF BET tickets, so total exposure is doubled.
+                totalRisk = betAmount * 2;
             }
 
             if (available < totalRisk) {
@@ -156,12 +196,9 @@ exports.placeBet = async (req, res) => {
                 const combinedOdds = validatedSelections.reduce((acc, sel) => acc * sel.odds, 1);
                 potentialPayout = betAmount * combinedOdds;
             } else if (betType === 'teaser') {
-                // Simplified teaser logic: fixed odds based on legs
-                const teaserMultipliers = { 2: 1.8, 3: 2.6, 4: 4.0, 5: 6.5 }; // Example
-                const multiplier = teaserMultipliers[selections.length] || selections.length * 1.2;
+                const multiplier = getTeaserMultiplier(modeRule, validatedSelections.length);
                 potentialPayout = betAmount * multiplier;
             } else if (betType === 'if_bet' || betType === 'reverse') {
-                // If bet payout is cumulative but complex. Simplified:
                 potentialPayout = betAmount * (validatedSelections[0].odds * validatedSelections[1].odds);
             }
 
@@ -182,7 +219,7 @@ exports.placeBet = async (req, res) => {
                 status: 'pending',
                 ipAddress,
                 userAgent,
-                teaserPoints: teaserPoints || 0
+                teaserPoints: Number(teaserPoints || 0)
             };
 
             if (betType === 'reverse') {
@@ -385,8 +422,8 @@ const internalSettleMatch = async ({ matchId, winner: manualWinner, settledBy = 
                         bet.potentialPayout = wager * newCombinedOdds;
                     } else if (betType === 'teaser') {
                         const wonCount = bet.selections.filter(l => l.status === 'won').length;
-                        const teaserMultipliers = { 1: 1.0, 2: 1.8, 3: 2.6, 4: 4.0 };
-                        const multiplier = teaserMultipliers[wonCount] || 1.0;
+                        const teaserRule = await getModeRule('teaser', session);
+                        const multiplier = getTeaserMultiplier(teaserRule, wonCount);
                         bet.potentialPayout = wager * multiplier;
                     }
                 }

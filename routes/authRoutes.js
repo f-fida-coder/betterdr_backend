@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { registerUser, loginUser, loginAdmin, loginAgent, getMe } = require('../controllers/authController');
+const { registerUser, loginUser, loginAdmin, loginAgent, getMe, updateProfile } = require('../controllers/authController');
 const { protect } = require('../middleware/authMiddleware');
 const rateLimit = require('../middleware/rateLimit');
 
@@ -11,5 +11,6 @@ router.post('/login', authLimiter, loginUser);
 router.post('/admin/login', authLimiter, loginAdmin);
 router.post('/agent/login', authLimiter, loginAgent);
 router.get('/me', protect, getMe);
+router.put('/profile', protect, updateProfile);
 
 module.exports = router;

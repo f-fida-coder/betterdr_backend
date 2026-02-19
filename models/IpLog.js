@@ -4,8 +4,13 @@ const ipLogSchema = new mongoose.Schema(
     {
         userId: {
             type: mongoose.Schema.Types.ObjectId,
-            ref: 'User',
             required: true,
+            index: true,
+        },
+        userModel: {
+            type: String,
+            enum: ['User', 'Agent', 'Admin'],
+            default: 'User',
             index: true,
         },
         ip: {
@@ -41,7 +46,11 @@ const ipLogSchema = new mongoose.Schema(
         },
         blockedBy: {
             type: mongoose.Schema.Types.ObjectId,
-            ref: 'User',
+            default: null,
+        },
+        blockedByModel: {
+            type: String,
+            enum: ['User', 'Agent', 'Admin'],
             default: null,
         },
         blockReason: {
@@ -56,7 +65,7 @@ const ipLogSchema = new mongoose.Schema(
     }
 );
 
-ipLogSchema.index({ userId: 1, ip: 1 }, { unique: true });
+ipLogSchema.index({ userId: 1, userModel: 1, ip: 1 }, { unique: true });
 
 ipLogSchema.virtual('id').get(function () {
     return this._id.toString();

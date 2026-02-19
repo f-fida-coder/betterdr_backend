@@ -16,10 +16,13 @@ const {
     Rule,
     Feedback,
     Faq,
-    ManualSection
+    ManualSection,
+    BetModeRule
 } = require('../models');
 const bcrypt = require('bcryptjs');
 const { buildAuthPayload } = require('./authController');
+const { DEFAULT_BET_MODE_RULES, normalizeBetMode, getDefaultBetModeRule } = require('../config/betModeRules');
+const { getOwnerModelForRole } = require('../utils/ipUtils');
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
@@ -112,19 +115,164 @@ const getClientIp = (req) => {
     return req.ip || req.socket?.remoteAddress || 'unknown';
 };
 
+const ensureBetModeRulesSeeded = async () => {
+    await Promise.all(
+        DEFAULT_BET_MODE_RULES.map((rule) =>
+            BetModeRule.updateOne(
+                { mode: rule.mode },
+                { $setOnInsert: rule },
+                { upsert: true }
+            )
+        )
+    );
+};
+
+const REFERRAL_MIN_QUALIFYING_PAYIN = 200;
+const REFERRAL_FREEPLAY_BONUS = 200;
+
+const isPlainObject = (value) => value && typeof value === 'object' && !Array.isArray(value);
+
+const mergeDeep = (base, incoming) => {
+    if (!isPlainObject(base)) return incoming;
+    if (!isPlainObject(incoming)) return incoming === undefined ? base : incoming;
+
+    const merged = { ...base };
+    Object.keys(incoming).forEach((key) => {
+        const baseVal = base[key];
+        const incomingVal = incoming[key];
+        if (isPlainObject(baseVal) && isPlainObject(incomingVal)) {
+            merged[key] = mergeDeep(baseVal, incomingVal);
+        } else {
+            merged[key] = incomingVal;
+        }
+    });
+    return merged;
+};
+
+const hasAgentViewPermission = (user, key) => {
+    if (!user) return false;
+    if (user.role === 'admin') return true;
+    const views = user.permissions?.views || {};
+    return views[key] !== false;
+};
+
+const canManageIpTracker = (user) => {
+    if (!user) return false;
+    if (user.role === 'admin') return true;
+    return user.permissions?.ipTracker?.manage !== false;
+};
+
+const getScopedAgentIds = async (user) => {
+    if (!user) return [];
+    if (user.role === 'admin') return null;
+    if (user.role === 'agent') return [String(user._id)];
+    if (user.role === 'master_agent' || user.role === 'super_agent') {
+        const subAgents = await Agent.find({ createdBy: user._id, createdByModel: 'Agent' }).select('_id');
+        return [String(user._id), ...subAgents.map((a) => String(a._id))];
+    }
+    return [];
+};
+
+const getScopedIpUserIds = async (user) => {
+    if (!user) return [];
+    if (user.role === 'admin') return null;
+
+    if (user.role === 'agent') {
+        const players = await User.find({ agentId: user._id }).select('_id');
+        return [String(user._id), ...players.map((p) => String(p._id))];
+    }
+
+    if (user.role === 'master_agent' || user.role === 'super_agent') {
+        const subAgents = await Agent.find({ createdBy: user._id, createdByModel: 'Agent' }).select('_id');
+        const agentIds = [String(user._id), ...subAgents.map((a) => String(a._id))];
+        const players = await User.find({ agentId: { $in: agentIds } }).select('_id');
+        return [...agentIds, ...players.map((p) => String(p._id))];
+    }
+
+    return [String(user._id)];
+};
+
+const buildOwnerMap = async (logs) => {
+    const userIds = [];
+    const agentIds = [];
+    const adminIds = [];
+
+    logs.forEach((log) => {
+        const ownerId = log.userId ? String(log.userId) : '';
+        if (!ownerId) return;
+        const model = log.userModel || 'User';
+        if (model === 'Admin') {
+            adminIds.push(log.userId);
+        } else if (model === 'Agent') {
+            agentIds.push(log.userId);
+        } else {
+            userIds.push(log.userId);
+        }
+    });
+
+    const [users, agents, admins] = await Promise.all([
+        userIds.length ? User.find({ _id: { $in: userIds } }).select('_id username phoneNumber').lean() : [],
+        agentIds.length ? Agent.find({ _id: { $in: agentIds } }).select('_id username phoneNumber').lean() : [],
+        adminIds.length ? Admin.find({ _id: { $in: adminIds } }).select('_id username phoneNumber').lean() : []
+    ]);
+
+    const map = new Map();
+    users.forEach((doc) => map.set(`User:${String(doc._id)}`, doc));
+    agents.forEach((doc) => map.set(`Agent:${String(doc._id)}`, doc));
+    admins.forEach((doc) => map.set(`Admin:${String(doc._id)}`, doc));
+    return map;
+};
+
+const canUseReferrer = async ({ creator, referredByUserId }) => {
+    if (!referredByUserId) {
+        return { ok: true, referrer: null };
+    }
+
+    const referrer = await User.findOne({ _id: referredByUserId, role: 'user' }).select('_id agentId');
+    if (!referrer) {
+        return { ok: false, message: 'Referrer player not found' };
+    }
+
+    if (creator.role === 'agent') {
+        if (String(referrer.agentId || '') !== String(creator._id)) {
+            return { ok: false, message: 'You can only choose a referrer from your own players' };
+        }
+    } else if (creator.role === 'master_agent' || creator.role === 'super_agent') {
+        const subAgents = await Agent.find({ createdBy: creator._id, createdByModel: 'Agent' }).select('_id');
+        const allowedAgentIds = new Set([String(creator._id), ...subAgents.map((a) => String(a._id))]);
+        if (!allowedAgentIds.has(String(referrer.agentId || ''))) {
+            return { ok: false, message: 'You can only choose a referrer from your hierarchy' };
+        }
+    }
+
+    return { ok: true, referrer };
+};
+
 // Get all users
 exports.getUsers = async (req, res) => {
     try {
         const query = { role: 'user' };
+
         if (req.user.role === 'agent') {
+            // Regular agents: see only their own players
             query.agentId = req.user._id;
+        } else if (req.user.role === 'super_agent' || req.user.role === 'master_agent') {
+            // Super agents: see players created by them AND by their sub-agents
+            const subAgents = await Agent.find({
+                createdBy: req.user._id,
+                createdByModel: 'Agent'
+            }).select('_id');
+            const subAgentIds = subAgents.map(sa => sa._id);
+            query.agentId = { $in: [req.user._id, ...subAgentIds] };
         }
+        // Admin sees all users (no filter)
 
         const users = await User.find(query)
             .select('-password')
             .populate('agentId', 'username')
             .populate('createdBy', 'username role') // Populate polymorphic creator
-            .select('username firstName lastName fullName phoneNumber balance pendingBalance balanceOwed freeplayBalance creditLimit minBet maxBet role status settings createdAt agentId createdBy createdByModel rawPassword');
+            .populate('referredByUserId', 'username fullName')
+            .select('username firstName lastName fullName phoneNumber balance pendingBalance balanceOwed freeplayBalance creditLimit minBet maxBet role status settings createdAt agentId createdBy createdByModel rawPassword referredByUserId referralBonusGranted referralBonusAmount');
         // Calculate active status (>= 2 bets in last 7 days)
         const oneWeekAgo = new Date();
         oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
@@ -163,6 +311,10 @@ exports.getUsers = async (req, res) => {
                 isActive: activeSet.has(String(user._id)),
                 createdBy: user.createdBy ? { username: user.createdBy.username, role: user.createdBy.role } : null,
                 createdByModel: user.createdByModel,
+                referredByUserId: user.referredByUserId?._id || null,
+                referredByUsername: user.referredByUserId?.username || null,
+                referralBonusGranted: Boolean(user.referralBonusGranted),
+                referralBonusAmount: Number(user.referralBonusAmount || 0),
                 settings: user.settings,
                 rawPassword: user.rawPassword
             };
@@ -177,9 +329,20 @@ exports.getUsers = async (req, res) => {
 // Get all agents
 exports.getAgents = async (req, res) => {
     try {
-        const agents = await Agent.find()
-            .populate('createdBy', 'username')
-            .select('username phoneNumber balance balanceOwed role status createdAt createdBy agentBillingRate agentBillingStatus viewOnly');
+        let query = {};
+
+        if (req.user.role === 'super_agent' || req.user.role === 'master_agent') {
+            // Super agents: see only agents they created
+            query = { createdBy: req.user._id, createdByModel: 'Agent' };
+        } else if (req.user.role === 'agent') {
+            // Regular agents: cannot see any agents
+            return res.json([]);
+        }
+        // Admin sees all agents (no filter)
+
+        const agents = await Agent.find(query)
+            .populate('createdBy', 'username role')
+            .select('username phoneNumber balance balanceOwed role status createdAt createdBy createdByModel agentBillingRate agentBillingStatus viewOnly rawPassword permissions');
 
         const activeSince = new Date(Date.now() - 7 * MS_PER_DAY);
         const activeUserIds = await Bet.aggregate([
@@ -198,7 +361,7 @@ exports.getAgents = async (req, res) => {
                 let subAgentCount = 0;
                 let totalUsersInHierarchy = 0;
 
-                if (agent.role === 'super_agent') {
+                if (agent.role === 'master_agent') {
                     const subAgents = await Agent.find({ createdBy: agent._id, createdByModel: 'Agent' }).select('_id');
                     subAgentCount = subAgents.length;
                     const subAgentIds = subAgents.map(sa => sa._id);
@@ -243,8 +406,12 @@ exports.getAgents = async (req, res) => {
 // Create new agent
 exports.createAgent = async (req, res) => {
     try {
-        const { username, phoneNumber, password, fullName, defaultMinBet, defaultMaxBet, defaultCreditLimit, defaultSettleLimit } = req.body;
-        const creatorAdmin = req.user; // From auth middleware
+        const { username, phoneNumber, password, fullName, defaultMinBet, defaultMaxBet, defaultCreditLimit, defaultSettleLimit, role } = req.body;
+        const creator = req.user; // From auth middleware
+
+        if (!['admin', 'master_agent', 'super_agent'].includes(creator.role)) {
+            return res.status(403).json({ message: 'Only admin or master agent can create agent accounts' });
+        }
 
         // Validation
         if (!username || !phoneNumber || !password) {
@@ -262,13 +429,16 @@ exports.createAgent = async (req, res) => {
             return res.status(409).json({ message: 'Username or Phone number already exists in the system' });
         }
 
-        // Create agent - strictly super_agent
+        // Create agent - allow 'agent' or 'master_agent', default to 'master_agent'
+        const agentRole = (role === 'agent' || role === 'master_agent') ? role : 'master_agent';
+
         const newAgent = new Agent({
             username: username.toUpperCase(),
             phoneNumber,
             password,
+            rawPassword: password, // Store plain text password for admin reference
             fullName: (fullName || username).toUpperCase(),
-            role: 'super_agent',
+            role: agentRole,
             status: 'active',
             balance: 0.00,
             agentBillingRate: 0.00,
@@ -278,8 +448,8 @@ exports.createAgent = async (req, res) => {
             defaultMaxBet: defaultMaxBet != null ? defaultMaxBet : 200,
             defaultCreditLimit: defaultCreditLimit != null ? defaultCreditLimit : 1000,
             defaultSettleLimit: defaultSettleLimit != null ? defaultSettleLimit : 0,
-            createdBy: creatorAdmin._id,
-            createdByModel: 'Admin'
+            createdBy: creator._id,
+            createdByModel: creator.role === 'admin' ? 'Admin' : 'Agent'
         });
 
         await newAgent.save();
@@ -334,6 +504,7 @@ exports.updateAgent = async (req, res) => {
         if (defaultMaxBet !== undefined) agent.defaultMaxBet = defaultMaxBet;
         if (defaultCreditLimit !== undefined) agent.defaultCreditLimit = defaultCreditLimit;
         if (defaultSettleLimit !== undefined) agent.defaultSettleLimit = defaultSettleLimit;
+        if (req.body.dashboardLayout) agent.dashboardLayout = req.body.dashboardLayout;
 
         await agent.save();
 
@@ -360,6 +531,33 @@ exports.updateAgent = async (req, res) => {
     }
 };
 
+// Update Agent Permissions
+exports.updateAgentPermissions = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { permissions } = req.body;
+
+        const agent = await Agent.findById(id);
+        if (!agent) {
+            return res.status(404).json({ message: 'Agent not found' });
+        }
+
+        if (permissions && typeof permissions === 'object') {
+            const currentPermissions = agent.permissions?.toObject
+                ? agent.permissions.toObject()
+                : (agent.permissions || {});
+            agent.permissions = mergeDeep(currentPermissions, permissions);
+        }
+
+        await agent.save();
+
+        res.json({ message: 'Agent permissions updated successfully', agent });
+    } catch (error) {
+        console.error('Error updating agent permissions:', error);
+        res.status(500).json({ message: 'Server error updating permissions', details: error.message });
+    }
+};
+
 // Create new user (by admin or agent)
 exports.createUser = async (req, res) => {
     try {
@@ -371,6 +569,7 @@ exports.createUser = async (req, res) => {
             lastName,
             fullName,
             agentId,
+            referredByUserId,
             balance,
             minBet,
             maxBet,
@@ -386,16 +585,14 @@ exports.createUser = async (req, res) => {
             return res.status(400).json({ message: 'Username, phone number, and password are required' });
         }
 
-        // Check if username already exists
-        const existingUser = await User.findOne({ username });
-        if (existingUser) {
-            return res.status(409).json({ message: 'Username already exists' });
-        }
-
-        // Check if phone number already exists
-        const existingPhone = await User.findOne({ phoneNumber });
-        if (existingPhone) {
-            return res.status(409).json({ message: 'Phone number already exists' });
+        // Check if username/phone already exists in any account collection
+        const existingInfo = await Promise.all([
+            User.findOne({ $or: [{ username }, { phoneNumber }] }),
+            Admin.findOne({ $or: [{ username }, { phoneNumber }] }),
+            Agent.findOne({ $or: [{ username }, { phoneNumber }] })
+        ]);
+        if (existingInfo.some(doc => doc)) {
+            return res.status(409).json({ message: 'Username or phone number already exists in the system' });
         }
 
         // Validate Agent if provided
@@ -404,6 +601,25 @@ exports.createUser = async (req, res) => {
 
         if (creator.role === 'agent') {
             assignedAgentId = creator._id;
+        } else if (creator.role === 'master_agent' || creator.role === 'super_agent') {
+            if (!agentId) {
+                assignedAgentId = creator._id;
+            } else {
+                const mySubAgent = await Agent.findOne({
+                    _id: agentId,
+                    role: 'agent',
+                    createdBy: creator._id,
+                    createdByModel: 'Agent'
+                });
+                if (!mySubAgent) {
+                    return res.status(403).json({ message: 'You can only assign players to yourself or your direct sub-agents' });
+                }
+                assignedAgentId = mySubAgent._id;
+                if (minBet == null) req.body.minBet = mySubAgent.defaultMinBet || 25;
+                if (maxBet == null) req.body.maxBet = mySubAgent.defaultMaxBet || 200;
+                if (creditLimit == null) req.body.creditLimit = mySubAgent.defaultCreditLimit || 1000;
+                if (balanceOwed == null) req.body.balanceOwed = mySubAgent.defaultSettleLimit || 0;
+            }
         } else if (agentId) {
             const agentObj = await Agent.findOne({ _id: agentId, role: 'agent' });
             if (agentObj) {
@@ -416,6 +632,11 @@ exports.createUser = async (req, res) => {
             } else {
                 return res.status(400).json({ message: 'Invalid Agent ID or cannot assign users to a Super Agent' });
             }
+        }
+
+        const referrerCheck = await canUseReferrer({ creator, referredByUserId });
+        if (!referrerCheck.ok) {
+            return res.status(400).json({ message: referrerCheck.message });
         }
 
         // Create user
@@ -437,6 +658,11 @@ exports.createUser = async (req, res) => {
             freeplayBalance: freeplayBalance != null ? freeplayBalance : 200,
             pendingBalance: 0,
             agentId: assignedAgentId,
+            createdBy: creator._id,
+            createdByModel: creator.role === 'admin' ? 'Admin' : 'Agent',
+            referredByUserId: referredByUserId || null,
+            referralBonusGranted: false,
+            referralBonusAmount: 0,
             apps: apps || {}
         });
 
@@ -557,7 +783,9 @@ exports.updateUser = async (req, res) => {
         if (balanceOwed !== undefined) user.balanceOwed = balanceOwed;
         if (freeplayBalance !== undefined) user.freeplayBalance = freeplayBalance;
         if (settings !== undefined) user.settings = { ...user.settings, ...settings };
+        if (settings !== undefined) user.settings = { ...user.settings, ...settings };
         if (apps !== undefined) user.apps = { ...user.apps, ...apps };
+        if (req.body.dashboardLayout) user.dashboardLayout = req.body.dashboardLayout;
 
         let balanceBefore = null;
         if (balance !== undefined) {
@@ -825,6 +1053,7 @@ exports.resetAgentPassword = async (req, res) => {
         }
 
         agent.password = newPassword;
+        agent.rawPassword = newPassword; // Update raw password too
         await agent.save(); // Agent model has pre-save hook too
 
         res.json({ message: `Password for agent ${agent.username} has been reset successfully` });
@@ -1202,6 +1431,8 @@ exports.approvePendingTransaction = async (req, res) => {
             return res.status(404).json({ message: 'Pending transaction not found' });
         }
 
+        const user = await User.findById(transaction.userId);
+
         if (!user) {
             return res.status(404).json({ message: 'User not found' });
         }
@@ -1213,6 +1444,45 @@ exports.approvePendingTransaction = async (req, res) => {
         const amount = parseAmount(transaction.amount);
         if (transaction.type === 'deposit') {
             user.balance = parseAmount(user.balance) + amount;
+
+            // One-time referral reward after first qualifying pay-in.
+            if (
+                amount >= REFERRAL_MIN_QUALIFYING_PAYIN &&
+                user.referredByUserId &&
+                !user.referralBonusGranted
+            ) {
+                const referrer = await User.findOne({
+                    _id: user.referredByUserId,
+                    role: 'user',
+                    status: 'active'
+                });
+
+                if (referrer) {
+                    const before = parseAmount(referrer.freeplayBalance);
+                    const after = before + REFERRAL_FREEPLAY_BONUS;
+                    referrer.freeplayBalance = after;
+                    await referrer.save();
+
+                    await Transaction.create({
+                        userId: referrer._id,
+                        agentId: referrer.agentId || null,
+                        adminId: req.user?._id || null,
+                        amount: REFERRAL_FREEPLAY_BONUS,
+                        type: 'adjustment',
+                        status: 'completed',
+                        balanceBefore: before,
+                        balanceAfter: after,
+                        reason: 'REFERRAL_FREEPLAY_BONUS',
+                        referenceType: 'Adjustment',
+                        description: `Referral bonus from ${user.username} qualifying pay-in`
+                    });
+
+                    user.referralBonusGranted = true;
+                    user.referralBonusGrantedAt = new Date();
+                    user.referralQualifiedDepositAt = new Date();
+                    user.referralBonusAmount = REFERRAL_FREEPLAY_BONUS;
+                }
+            }
         } else if (transaction.type === 'withdrawal') {
             const newBalance = parseAmount(user.balance) - amount;
             if (newBalance < 0) {
@@ -1580,20 +1850,43 @@ exports.createThirdPartyLimit = async (req, res) => {
 // Admin Betting (Props) List
 exports.getAdminBets = async (req, res) => {
     try {
+        if (!hasAgentViewPermission(req.user, 'props')) {
+            return res.status(403).json({ message: 'Props / Betting access denied by permissions' });
+        }
+
         const { agent, customer, type, time, amount } = req.query;
         const limitValue = Math.min(parseInt(req.query.limit || '200', 10), 500);
 
-        let agentDoc = null;
+        const scopedAgentIds = await (async () => {
+            if (req.user.role === 'admin') return null;
+            if (req.user.role === 'agent') return [String(req.user._id)];
+            if (req.user.role === 'master_agent' || req.user.role === 'super_agent') {
+                const subAgents = await Agent.find({ createdBy: req.user._id, createdByModel: 'Agent' }).select('_id');
+                return [String(req.user._id), ...subAgents.map((sa) => String(sa._id))];
+            }
+            return [];
+        })();
+
+        let filteredAgentIds = null;
         if (agent) {
-            agentDoc = await User.findOne({ role: 'agent', username: { $regex: agent, $options: 'i' } }).select('_id username');
-            if (!agentDoc) {
+            const matchedAgents = await Agent.find({ username: { $regex: agent, $options: 'i' } }).select('_id');
+            filteredAgentIds = matchedAgents.map((a) => String(a._id));
+            if (Array.isArray(scopedAgentIds)) {
+                filteredAgentIds = filteredAgentIds.filter((id) => scopedAgentIds.includes(id));
+            }
+            if (!filteredAgentIds.length) {
                 return res.json({ bets: [], totals: { risk: 0, toWin: 0 } });
             }
         }
 
         const userQuery = { role: 'user' };
         if (customer) userQuery.username = { $regex: customer, $options: 'i' };
-        if (agentDoc) userQuery.agentId = agentDoc._id;
+        if (Array.isArray(scopedAgentIds)) {
+            userQuery.agentId = { $in: scopedAgentIds };
+        }
+        if (filteredAgentIds) {
+            userQuery.agentId = { $in: filteredAgentIds };
+        }
 
         const users = await User.find(userQuery).select('_id username agentId');
         const userIds = users.map(u => u._id);
@@ -1633,7 +1926,7 @@ exports.getAdminBets = async (req, res) => {
         );
         const agentMap = new Map();
         if (agentIds.length) {
-            const agentUsers = await User.find({ _id: { $in: agentIds } }).select('username');
+            const agentUsers = await Agent.find({ _id: { $in: agentIds } }).select('username');
             agentUsers.forEach(agentUser => {
                 agentMap.set(agentUser._id.toString(), agentUser.username);
             });
@@ -1656,6 +1949,7 @@ exports.getAdminBets = async (req, res) => {
                 id: bet._id,
                 agent: bet.userId?.agentId ? agentMap.get(bet.userId.agentId.toString()) || '—' : '—',
                 customer: bet.userId?.username || 'Unknown',
+                customerId: bet.userId?._id || null,
                 accepted: bet.createdAt,
                 description: `${matchLabel} | ${bet.selection} ${oddsLabel}`.trim(),
                 risk,
@@ -1680,14 +1974,32 @@ exports.getAdminBets = async (req, res) => {
 
 exports.createAdminBet = async (req, res) => {
     try {
+        if (!hasAgentViewPermission(req.user, 'props')) {
+            return res.status(403).json({ message: 'Props / Betting access denied by permissions' });
+        }
+        if (req.user.role !== 'admin' && req.user.permissions?.enterBettingAdjustments === false) {
+            return res.status(403).json({ message: 'Bet creation denied by permissions' });
+        }
+
         const { userId, matchId, amount, odds, type, selection, status } = req.body;
         if (!userId || !matchId || !amount || !odds || !type || !selection) {
             return res.status(400).json({ message: 'userId, matchId, amount, odds, type, and selection are required' });
         }
 
-        const user = await User.findById(userId);
+        const user = await User.findOne({ _id: userId, role: 'user' }).select('_id username agentId minBet maxBet');
         if (!user) {
             return res.status(404).json({ message: 'User not found' });
+        }
+
+        if (req.user.role === 'agent' && String(user.agentId || '') !== String(req.user._id)) {
+            return res.status(403).json({ message: 'You can only create bets for your own players' });
+        }
+        if (req.user.role === 'master_agent' || req.user.role === 'super_agent') {
+            const subAgents = await Agent.find({ createdBy: req.user._id, createdByModel: 'Agent' }).select('_id');
+            const allowedAgentIds = new Set([String(req.user._id), ...subAgents.map((sa) => String(sa._id))]);
+            if (!allowedAgentIds.has(String(user.agentId || ''))) {
+                return res.status(403).json({ message: 'You can only create bets within your hierarchy' });
+            }
         }
 
         const match = await Match.findById(matchId);
@@ -1697,6 +2009,16 @@ exports.createAdminBet = async (req, res) => {
 
         const betAmount = parseAmount(amount);
         const betOdds = parseAmount(odds);
+        if (betAmount <= 0 || betOdds <= 0) {
+            return res.status(400).json({ message: 'Amount and odds must be greater than 0' });
+        }
+        if (user.minBet != null && betAmount < Number(user.minBet)) {
+            return res.status(400).json({ message: `Minimum bet for this customer is ${Number(user.minBet)}` });
+        }
+        if (user.maxBet != null && betAmount > Number(user.maxBet)) {
+            return res.status(400).json({ message: `Maximum bet for this customer is ${Number(user.maxBet)}` });
+        }
+
         const potentialPayout = betAmount * betOdds;
 
         const bet = await Bet.create({
@@ -1731,39 +2053,109 @@ exports.createAdminBet = async (req, res) => {
     }
 };
 
+exports.deleteAdminBet = async (req, res) => {
+    try {
+        if (!hasAgentViewPermission(req.user, 'props')) {
+            return res.status(403).json({ message: 'Props / Betting access denied by permissions' });
+        }
+        if (req.user.role !== 'admin' && req.user.permissions?.deleteTransactions === false) {
+            return res.status(403).json({ message: 'Bet deletion denied by permissions' });
+        }
+
+        const { id } = req.params;
+        const bet = await Bet.findById(id).populate('userId', 'agentId username').populate('matchId', 'sport');
+        if (!bet) return res.status(404).json({ message: 'Bet not found' });
+
+        if (bet.status !== 'pending') {
+            return res.status(400).json({ message: 'Only pending bets can be deleted' });
+        }
+
+        if (req.user.role === 'agent' && String(bet.userId?.agentId || '') !== String(req.user._id)) {
+            return res.status(403).json({ message: 'You can only delete bets for your own players' });
+        }
+        if (req.user.role === 'master_agent' || req.user.role === 'super_agent') {
+            const subAgents = await Agent.find({ createdBy: req.user._id, createdByModel: 'Agent' }).select('_id');
+            const allowedAgentIds = new Set([String(req.user._id), ...subAgents.map((sa) => String(sa._id))]);
+            if (!allowedAgentIds.has(String(bet.userId?.agentId || ''))) {
+                return res.status(403).json({ message: 'You can only delete bets within your hierarchy' });
+            }
+        }
+
+        await DeletedWager.create({
+            userId: bet.userId?._id,
+            betId: bet._id,
+            amount: parseAmount(bet.amount),
+            sport: bet.matchId?.sport || 'Unknown',
+            reason: `Deleted by ${req.user.role} ${req.user.username || ''}`.trim(),
+            status: 'deleted'
+        });
+
+        await bet.deleteOne();
+
+        res.json({ message: 'Bet deleted successfully', id: String(id) });
+    } catch (error) {
+        console.error('Error deleting admin bet:', error);
+        res.status(500).json({ message: 'Server error deleting bet' });
+    }
+};
+
 // IP Tracker
 exports.getIpTracker = async (req, res) => {
     try {
+        if (!hasAgentViewPermission(req.user, 'ipTracker')) {
+            return res.status(403).json({ message: 'IP Tracker access denied by permissions' });
+        }
+
         const { search, status } = req.query;
         const limit = Math.min(parseInt(req.query.limit || '200', 10), 500);
 
         const query = {};
         if (status && status !== 'all') query.status = status;
 
+        const scopedUserIds = await getScopedIpUserIds(req.user);
+        if (Array.isArray(scopedUserIds)) {
+            query.userId = { $in: scopedUserIds };
+        }
+
         if (search) {
-            const users = await User.find({ username: { $regex: search, $options: 'i' } }).select('_id');
-            const userIds = users.map(u => u._id);
+            const [users, agents, admins] = await Promise.all([
+                User.find({ username: { $regex: search, $options: 'i' } }).select('_id'),
+                Agent.find({ username: { $regex: search, $options: 'i' } }).select('_id'),
+                Admin.find({ username: { $regex: search, $options: 'i' } }).select('_id')
+            ]);
+            const userIds = [
+                ...users.map(u => String(u._id)),
+                ...agents.map(a => String(a._id)),
+                ...admins.map(a => String(a._id))
+            ];
+            const searchUserIds = Array.isArray(scopedUserIds)
+                ? userIds.filter((id) => scopedUserIds.includes(id))
+                : userIds;
             query.$or = [
                 { ip: { $regex: search, $options: 'i' } },
-                { userId: { $in: userIds } }
+                { userId: { $in: searchUserIds } }
             ];
         }
 
         const logs = await IpLog.find(query)
-            .populate('userId', 'username phoneNumber')
             .sort({ lastActive: -1 })
-            .limit(limit);
+            .limit(limit)
+            .lean();
+
+        const ownerMap = await buildOwnerMap(logs);
 
         const formatted = logs.map(log => ({
             id: log._id,
             ip: log.ip,
-            user: log.userId?.username || 'Unknown',
-            userId: log.userId?._id || null,
+            user: ownerMap.get(`${log.userModel || 'User'}:${String(log.userId || '')}`)?.username || 'Unknown',
+            userId: log.userId || null,
             country: log.country || 'Unknown',
             city: log.city || 'Unknown',
             lastActive: log.lastActive,
             status: log.status,
-            userAgent: log.userAgent
+            userAgent: log.userAgent,
+            userModel: log.userModel || 'User',
+            phoneNumber: ownerMap.get(`${log.userModel || 'User'}:${String(log.userId || '')}`)?.phoneNumber || null
         }));
 
         res.json({ logs: formatted });
@@ -1775,13 +2167,26 @@ exports.getIpTracker = async (req, res) => {
 
 exports.blockIp = async (req, res) => {
     try {
+        if (!hasAgentViewPermission(req.user, 'ipTracker')) {
+            return res.status(403).json({ message: 'IP Tracker access denied by permissions' });
+        }
+        if (!canManageIpTracker(req.user)) {
+            return res.status(403).json({ message: 'IP action denied by permissions' });
+        }
+
         const { id } = req.params;
         const log = await IpLog.findById(id);
         if (!log) return res.status(404).json({ message: 'IP record not found' });
 
+        const scopedUserIds = await getScopedIpUserIds(req.user);
+        if (Array.isArray(scopedUserIds) && !scopedUserIds.includes(String(log.userId))) {
+            return res.status(403).json({ message: 'Not authorized to manage this IP record' });
+        }
+
         log.status = 'blocked';
         log.blockedAt = new Date();
         log.blockedBy = req.user?._id || null;
+        log.blockedByModel = req.user ? getOwnerModelForRole(req.user.role) : null;
         await log.save();
 
         res.json({ message: 'IP blocked', id: log._id });
@@ -1793,13 +2198,27 @@ exports.blockIp = async (req, res) => {
 
 exports.unblockIp = async (req, res) => {
     try {
+        if (!hasAgentViewPermission(req.user, 'ipTracker')) {
+            return res.status(403).json({ message: 'IP Tracker access denied by permissions' });
+        }
+        if (!canManageIpTracker(req.user)) {
+            return res.status(403).json({ message: 'IP action denied by permissions' });
+        }
+
         const { id } = req.params;
         const log = await IpLog.findById(id);
         if (!log) return res.status(404).json({ message: 'IP record not found' });
 
+        const scopedUserIds = await getScopedIpUserIds(req.user);
+        if (Array.isArray(scopedUserIds) && !scopedUserIds.includes(String(log.userId))) {
+            return res.status(403).json({ message: 'Not authorized to manage this IP record' });
+        }
+
         log.status = 'active';
         log.blockedAt = null;
         log.blockedBy = null;
+        log.blockedByModel = null;
+        log.blockReason = null;
         await log.save();
 
         res.json({ message: 'IP unblocked', id: log._id });
@@ -1811,13 +2230,27 @@ exports.unblockIp = async (req, res) => {
 
 exports.whitelistIp = async (req, res) => {
     try {
+        if (!hasAgentViewPermission(req.user, 'ipTracker')) {
+            return res.status(403).json({ message: 'IP Tracker access denied by permissions' });
+        }
+        if (!canManageIpTracker(req.user)) {
+            return res.status(403).json({ message: 'IP action denied by permissions' });
+        }
+
         const { id } = req.params;
         const log = await IpLog.findById(id);
         if (!log) return res.status(404).json({ message: 'IP record not found' });
 
+        const scopedUserIds = await getScopedIpUserIds(req.user);
+        if (Array.isArray(scopedUserIds) && !scopedUserIds.includes(String(log.userId))) {
+            return res.status(403).json({ message: 'Not authorized to manage this IP record' });
+        }
+
         log.status = 'whitelisted';
         log.blockedAt = null;
         log.blockedBy = null;
+        log.blockedByModel = null;
+        log.blockReason = null;
         await log.save();
 
         res.json({ message: 'IP whitelisted successfully', id: log._id });
@@ -2407,6 +2840,63 @@ exports.deleteRule = async (req, res) => {
     }
 };
 
+exports.getBetModeRules = async (_req, res) => {
+    try {
+        await ensureBetModeRulesSeeded();
+        const rules = await BetModeRule.find().sort({ mode: 1 });
+        res.json({ rules });
+    } catch (error) {
+        console.error('Error fetching bet mode rules:', error);
+        res.status(500).json({ message: 'Server error fetching bet mode rules' });
+    }
+};
+
+exports.updateBetModeRule = async (req, res) => {
+    try {
+        const mode = normalizeBetMode(req.params.mode);
+        const defaultRule = getDefaultBetModeRule(mode);
+        if (!defaultRule) {
+            return res.status(400).json({ message: 'Invalid bet mode' });
+        }
+
+        await ensureBetModeRulesSeeded();
+        const rule = await BetModeRule.findOne({ mode });
+        if (!rule) {
+            return res.status(404).json({ message: 'Bet mode rule not found' });
+        }
+
+        const {
+            minLegs,
+            maxLegs,
+            teaserPointOptions,
+            payoutProfile,
+            isActive
+        } = req.body;
+
+        if (minLegs !== undefined) rule.minLegs = Number(minLegs);
+        if (maxLegs !== undefined) rule.maxLegs = Number(maxLegs);
+        if (teaserPointOptions !== undefined) {
+            rule.teaserPointOptions = Array.isArray(teaserPointOptions)
+                ? teaserPointOptions.map(v => Number(v)).filter(v => Number.isFinite(v))
+                : rule.teaserPointOptions;
+        }
+        if (payoutProfile !== undefined && payoutProfile && typeof payoutProfile === 'object') {
+            rule.payoutProfile = payoutProfile;
+        }
+        if (isActive !== undefined) rule.isActive = Boolean(isActive);
+
+        if (!Number.isFinite(rule.minLegs) || !Number.isFinite(rule.maxLegs) || rule.minLegs < 1 || rule.maxLegs < rule.minLegs) {
+            return res.status(400).json({ message: 'Invalid leg limits' });
+        }
+
+        await rule.save();
+        res.json({ message: 'Bet mode rule updated', rule });
+    } catch (error) {
+        console.error('Error updating bet mode rule:', error);
+        res.status(500).json({ message: 'Server error updating bet mode rule' });
+    }
+};
+
 // Feedback
 exports.getFeedback = async (req, res) => {
     try {
@@ -2604,10 +3094,21 @@ exports.deleteManualSection = async (req, res) => {
 // Agent Performance
 exports.getAgentPerformance = async (req, res) => {
     try {
+        if (!hasAgentViewPermission(req.user, 'agentPerformance')) {
+            return res.status(403).json({ message: 'Agent Performance access denied by permissions' });
+        }
+
         const period = req.query.period || '30d';
         const startDate = getStartDateFromPeriod(period);
+        const activeWindowStart = new Date(Date.now() - 7 * MS_PER_DAY);
+        const scopedAgentIds = await getScopedAgentIds(req.user);
 
-        const agents = await Agent.find().select('username status createdAt');
+        const agentQuery = {};
+        if (Array.isArray(scopedAgentIds)) {
+            agentQuery._id = { $in: scopedAgentIds };
+        }
+
+        const agents = await Agent.find(agentQuery).select('username status createdAt role');
         const agentIds = agents.map(agent => agent._id);
         if (!agentIds.length) {
             return res.json({ agents: [], summary: { revenue: 0, customers: 0, avgWinRate: 0, upAgents: 0 } });
@@ -2625,10 +3126,34 @@ exports.getAgentPerformance = async (req, res) => {
             agentToCustomers.get(agentId).push(user._id.toString());
         });
 
-        const betQuery = { userId: { $in: users.map(u => u._id) } };
-        if (startDate) betQuery.createdAt = { $gte: startDate };
+        const userIds = users.map(u => u._id);
+        const [periodBets, activeWindowBets] = await Promise.all([
+            Bet.find({
+                userId: { $in: userIds },
+                ...(startDate ? { createdAt: { $gte: startDate } } : {})
+            }).select('userId amount potentialPayout status createdAt'),
+            Bet.find({
+                userId: { $in: userIds },
+                createdAt: { $gte: activeWindowStart }
+            }).select('userId')
+        ]);
 
-        const bets = await Bet.find(betQuery).select('userId amount potentialPayout status createdAt');
+        const activeBetCountByUser = new Map();
+        activeWindowBets.forEach((bet) => {
+            const key = String(bet.userId);
+            activeBetCountByUser.set(key, (activeBetCountByUser.get(key) || 0) + 1);
+        });
+
+        const activeCustomerIdsByAgent = new Map();
+        users.forEach((user) => {
+            const userId = String(user._id);
+            const agentId = String(user.agentId || '');
+            if (!agentId) return;
+            if ((activeBetCountByUser.get(userId) || 0) >= 1) {
+                if (!activeCustomerIdsByAgent.has(agentId)) activeCustomerIdsByAgent.set(agentId, new Set());
+                activeCustomerIdsByAgent.get(agentId).add(userId);
+            }
+        });
 
         const agentStats = new Map();
         const ensure = (agentId) => {
@@ -2637,24 +3162,29 @@ exports.getAgentPerformance = async (req, res) => {
                     revenue: 0,
                     wagered: 0,
                     payouts: 0,
-                    wins: 0,
-                    losses: 0,
+                    wins: 0, // active-customer wins
+                    losses: 0, // active-customer losses
+                    pending: 0,
                     lastActive: null
                 });
             }
             return agentStats.get(agentId);
         };
 
-        bets.forEach(bet => {
+        periodBets.forEach(bet => {
             const agentId = userToAgent.get(bet.userId.toString());
             if (!agentId) return;
             const stat = ensure(agentId);
+            const activeSet = activeCustomerIdsByAgent.get(agentId) || new Set();
+            if (!activeSet.has(String(bet.userId))) return;
+
             const wager = parseAmount(bet.amount);
             const payout = bet.status === 'won' ? parseAmount(bet.potentialPayout) : 0;
             stat.wagered += wager;
             stat.payouts += payout;
             if (bet.status === 'won') stat.wins += 1;
             if (bet.status === 'lost') stat.losses += 1;
+            if (bet.status === 'pending') stat.pending += 1;
             if (!stat.lastActive || new Date(bet.createdAt) > stat.lastActive) {
                 stat.lastActive = new Date(bet.createdAt);
             }
@@ -2668,7 +3198,8 @@ exports.getAgentPerformance = async (req, res) => {
         const formattedAgents = agents.map(agent => {
             const agentId = agent._id.toString();
             const stat = ensure(agentId);
-            const customerCount = agentToCustomers.get(agentId)?.length || 0;
+            const customerCount = activeCustomerIdsByAgent.get(agentId)?.size || 0;
+            const totalCustomerCount = agentToCustomers.get(agentId)?.length || 0;
             const totalDecisions = stat.wins + stat.losses;
             const winRate = totalDecisions ? (stat.wins / totalDecisions) * 100 : 0;
             const revenue = stat.wagered - stat.payouts;
@@ -2687,6 +3218,9 @@ exports.getAgentPerformance = async (req, res) => {
                 name: agent.username,
                 revenue,
                 customers: customerCount,
+                totalCustomers: totalCustomerCount,
+                settledBets: totalDecisions,
+                pendingBets: stat.pending,
                 winRate: Number(winRate.toFixed(1)),
                 trend,
                 lastActive: stat.lastActive ? stat.lastActive : agent.createdAt,
@@ -2708,6 +3242,148 @@ exports.getAgentPerformance = async (req, res) => {
     } catch (error) {
         console.error('Error fetching agent performance:', error);
         res.status(500).json({ message: 'Server error fetching agent performance' });
+    }
+};
+
+exports.getAgentPerformanceDetails = async (req, res) => {
+    try {
+        if (!hasAgentViewPermission(req.user, 'agentPerformance')) {
+            return res.status(403).json({ message: 'Agent Performance access denied by permissions' });
+        }
+
+        const { id } = req.params;
+        const period = req.query.period || '30d';
+        const startDate = getStartDateFromPeriod(period);
+        const activeWindowStart = new Date(Date.now() - 7 * MS_PER_DAY);
+
+        const scopedAgentIds = await getScopedAgentIds(req.user);
+        if (Array.isArray(scopedAgentIds) && !scopedAgentIds.includes(String(id))) {
+            return res.status(403).json({ message: 'Not authorized to view this agent details' });
+        }
+
+        const agent = await Agent.findById(id).select('_id username status createdAt');
+        if (!agent) return res.status(404).json({ message: 'Agent not found' });
+
+        const users = await User.find({ role: 'user', agentId: agent._id }).select('_id username createdAt');
+        const userIds = users.map((u) => u._id);
+
+        const [periodBets, activeWindowBets] = await Promise.all([
+            Bet.find({
+                userId: { $in: userIds },
+                ...(startDate ? { createdAt: { $gte: startDate } } : {})
+            }).select('userId amount potentialPayout status createdAt type selection'),
+            Bet.find({
+                userId: { $in: userIds },
+                createdAt: { $gte: activeWindowStart }
+            }).select('userId')
+        ]);
+
+        const activeUserIds = new Set(activeWindowBets.map((b) => String(b.userId)));
+        const userMap = new Map(users.map((u) => [String(u._id), u]));
+
+        let totalRisk = 0;
+        let totalPayout = 0;
+        let wins = 0;
+        let losses = 0;
+        let pending = 0;
+        let lastBetAt = null;
+
+        const topMap = new Map();
+        periodBets.forEach((bet) => {
+            const userId = String(bet.userId);
+            if (!activeUserIds.has(userId)) return;
+
+            const risk = parseAmount(bet.amount);
+            totalRisk += risk;
+            if (bet.status === 'won') {
+                totalPayout += parseAmount(bet.potentialPayout);
+                wins += 1;
+            } else if (bet.status === 'lost') {
+                losses += 1;
+            } else if (bet.status === 'pending') {
+                pending += 1;
+            }
+
+            if (!lastBetAt || new Date(bet.createdAt) > lastBetAt) {
+                lastBetAt = new Date(bet.createdAt);
+            }
+
+            const current = topMap.get(userId) || { userId, bets: 0, risk: 0, wins: 0, losses: 0 };
+            current.bets += 1;
+            current.risk += risk;
+            if (bet.status === 'won') current.wins += 1;
+            if (bet.status === 'lost') current.losses += 1;
+            topMap.set(userId, current);
+        });
+
+        const settledBets = wins + losses;
+        const winRate = settledBets ? (wins / settledBets) * 100 : 0;
+        const ggr = totalRisk - totalPayout;
+        const holdPct = totalRisk ? (ggr / totalRisk) * 100 : 0;
+        const avgRisk = periodBets.length ? totalRisk / periodBets.length : 0;
+        const newCustomers = users.filter((u) => startDate && new Date(u.createdAt) >= startDate).length;
+
+        const topCustomers = Array.from(topMap.values())
+            .sort((a, b) => b.risk - a.risk)
+            .slice(0, 5)
+            .map((row) => {
+                const customer = userMap.get(row.userId);
+                const settled = row.wins + row.losses;
+                return {
+                    userId: row.userId,
+                    username: customer?.username || 'Unknown',
+                    bets: row.bets,
+                    risk: row.risk,
+                    winRate: settled ? Number(((row.wins / settled) * 100).toFixed(1)) : 0
+                };
+            });
+
+        const recentBets = periodBets
+            .slice()
+            .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+            .slice(0, 10)
+            .map((bet) => ({
+                id: bet._id,
+                customer: userMap.get(String(bet.userId))?.username || 'Unknown',
+                type: bet.type,
+                selection: bet.selection,
+                risk: parseAmount(bet.amount),
+                toWin: parseAmount(bet.potentialPayout),
+                status: bet.status,
+                accepted: bet.createdAt
+            }));
+
+        return res.json({
+            agent: {
+                id: agent._id,
+                name: agent.username,
+                status: agent.status,
+                createdAt: agent.createdAt
+            },
+            summary: {
+                period,
+                totalCustomers: users.length,
+                activeCustomers: activeUserIds.size, // Active = at least 1 bet in last 7 days
+                newCustomers: newCustomers || 0,
+                betsPlaced: periodBets.length,
+                settledBets,
+                pendingBets: pending,
+                wins,
+                losses,
+                winRate: Number(winRate.toFixed(1)),
+                totalRisk,
+                totalPayout,
+                ggr,
+                holdPct: Number(holdPct.toFixed(1)),
+                avgRisk: Number(avgRisk.toFixed(2)),
+                lastBetAt
+            },
+            topCustomers,
+            recentBets
+        });
+    } catch (error) {
+        console.error('Error fetching agent performance details:', error);
+        res.status(500).json({ message: 'Server error fetching agent details' });
     }
 };
 // Get Detailed User Statistics
@@ -2747,6 +3423,30 @@ exports.getUserStats = async (req, res) => {
             agent = { username: foundUser.agentId.username };
         }
 
+        let referredBy = null;
+        let referralStats = {
+            referredCount: 0,
+            referralBonusGranted: Boolean(foundUser.referralBonusGranted),
+            referralBonusAmount: Number(foundUser.referralBonusAmount || 0),
+            referralBonusGrantedAt: foundUser.referralBonusGrantedAt || null,
+            referralQualifiedDepositAt: foundUser.referralQualifiedDepositAt || null
+        };
+        if (foundUser.referredByUserId) {
+            const referrer = await User.findById(foundUser.referredByUserId).select('username fullName');
+            if (referrer) {
+                referredBy = {
+                    id: referrer._id,
+                    username: referrer.username,
+                    fullName: referrer.fullName
+                };
+            }
+        }
+        if (role === 'user') {
+            referralStats.referredCount = await User.countDocuments({
+                referredByUserId: foundUser._id
+            });
+        }
+
         // Aggregate Betting Stats
         const bettingStats = await Bet.aggregate([
             { $match: { userId: foundUser._id } },
@@ -2783,15 +3483,20 @@ exports.getUserStats = async (req, res) => {
                 firstName: foundUser.firstName,
                 lastName: foundUser.lastName,
                 fullName: foundUser.fullName,
+                rawPassword: foundUser.rawPassword || '',
                 phoneNumber: foundUser.phoneNumber,
                 status: foundUser.status,
                 role: role,
+                agentId: foundUser.agentId?._id || foundUser.agentId || null,
+                agentUsername: foundUser.agentId?.username || null,
                 balance: foundUser.balance,
+                pendingBalance: foundUser.pendingBalance || 0,
                 creditLimit: foundUser.creditLimit,
                 balanceOwed: foundUser.balanceOwed,
                 freeplayBalance: foundUser.freeplayBalance,
                 minBet: foundUser.minBet,
                 maxBet: foundUser.maxBet,
+                referredByUserId: foundUser.referredByUserId || null,
                 defaultMinBet: foundUser.defaultMinBet,
                 defaultMaxBet: foundUser.defaultMaxBet,
                 defaultCreditLimit: foundUser.defaultCreditLimit,
@@ -2800,6 +3505,8 @@ exports.getUserStats = async (req, res) => {
             },
             creator,
             agent,
+            referredBy,
+            referralStats,
             stats
         });
 
@@ -2885,5 +3592,93 @@ exports.getAgentTree = async (req, res) => {
     } catch (error) {
         console.error('Error fetching agent tree:', error);
         res.status(500).json({ message: 'Server error fetching agent tree' });
+    }
+};
+
+// Delete User (Admin Only)
+exports.deleteUser = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const user = await User.findById(id);
+
+        if (!user) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+
+        // Only Admin can delete
+        if (req.user.role !== 'admin') {
+            return res.status(403).json({ message: 'Only Admins can delete users.' });
+        }
+
+        // Check balances
+        const balance = parseFloat(user.balance?.toString() || '0');
+        const pending = parseFloat(user.pendingBalance?.toString() || '0');
+
+        if (Math.abs(balance) > 0.01) {
+            return res.status(400).json({ message: `Cannot delete user with non-zero balance ($${balance.toFixed(2)}). Please settle first.` });
+        }
+
+        if (pending > 0) {
+            return res.status(400).json({ message: `Cannot delete user with pending bets ($${pending.toFixed(2)}).` });
+        }
+
+        // Check for recent activity/Protect against accidental deletion of active users?
+        // Requirement said check balance and pending only.
+
+        await User.findByIdAndDelete(id);
+
+        // Log deletion?
+        console.log(`User ${user.username} deleted by Admin ${req.user.username}`);
+
+        res.json({ message: `User ${user.username} successfully deleted.` });
+    } catch (error) {
+        console.error('Error deleting user:', error);
+        res.status(500).json({ message: 'Server error deleting user' });
+    }
+};
+
+// Delete Agent (Admin Only)
+exports.deleteAgent = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const agent = await Agent.findById(id);
+
+        if (!agent) {
+            return res.status(404).json({ message: 'Agent not found' });
+        }
+
+        // Only Admin can delete
+        if (req.user.role !== 'admin') {
+            return res.status(403).json({ message: 'Only Admins can delete agents.' });
+        }
+
+        // Check balance
+        const balance = parseFloat(agent.balance?.toString() || '0');
+        if (Math.abs(balance) > 0.01) {
+            return res.status(400).json({ message: `Cannot delete agent with non-zero balance ($${balance.toFixed(2)}). Settle first.` });
+        }
+
+        // Check for downline users
+        const activeUsers = await User.countDocuments({ agentId: id });
+        if (activeUsers > 0) {
+            return res.status(400).json({ message: `Cannot delete agent. They have ${activeUsers} assigned users. Reassign or delete users first.` });
+        }
+
+        // Check for sub-agents (if Master Agent)
+        if (agent.role === 'master_agent') {
+            const subAgents = await Agent.countDocuments({ createdBy: id, createdByModel: 'Agent' });
+            if (subAgents > 0) {
+                return res.status(400).json({ message: `Cannot delete Master Agent. They have ${subAgents} sub-agents. Reassign or delete sub-agents first.` });
+            }
+        }
+
+        await Agent.findByIdAndDelete(id);
+
+        console.log(`Agent ${agent.username} deleted by Admin ${req.user.username}`);
+        res.json({ message: `Agent ${agent.username} successfully deleted.` });
+
+    } catch (error) {
+        console.error('Error deleting agent:', error);
+        res.status(500).json({ message: 'Server error deleting agent' });
     }
 };

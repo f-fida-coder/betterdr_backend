@@ -1,13 +1,12 @@
 const jwt = require('jsonwebtoken');
 const { User, Admin, Agent, IpLog } = require('../models');
+const { getClientIp, getOwnerModelForRole, parseAllowlist } = require('../utils/ipUtils');
 
-const getClientIp = (req) => {
-    const forwarded = req.headers['x-forwarded-for'];
-    if (forwarded) {
-        return forwarded.split(',')[0].trim();
-    }
-    return req.ip || req.socket?.remoteAddress || 'unknown';
-};
+const ownerFilter = (user, userModel, ip) => ({
+    userId: user._id,
+    ip,
+    $or: [{ userModel }, { userModel: { $exists: false } }]
+});
 
 const protect = async (req, res, next) => {
     let token;
@@ -24,7 +23,7 @@ const protect = async (req, res, next) => {
             // Select Model based on role in token
             if (decoded.role === 'admin') {
                 req.user = await Admin.findById(decoded.id).select('-password');
-            } else if (decoded.role === 'agent' || decoded.role === 'super_agent') {
+            } else if (decoded.role === 'agent' || decoded.role === 'master_agent' || decoded.role === 'super_agent') {
                 req.user = await Agent.findById(decoded.id).select('-password');
             } else {
                 req.user = await User.findById(decoded.id).select('-password');
@@ -43,33 +42,33 @@ const protect = async (req, res, next) => {
             }
 
             const ipBlockingEnabled = String(process.env.IP_BLOCKING_ENABLED || 'true').toLowerCase() === 'true';
-            const allowlist = (process.env.IP_ALLOWLIST || '')
-                .split(',')
-                .map(v => v.trim())
-                .filter(Boolean);
+            const allowlist = parseAllowlist(process.env.IP_ALLOWLIST || '');
             const ip = getClientIp(req);
+            const userModel = getOwnerModelForRole(req.user.role);
             if (ip && ip !== 'unknown') {
-                if (ipBlockingEnabled && !allowlist.includes(ip)) {
-                    const existingIp = await IpLog.findOne({ userId: req.user._id, ip });
-                    if (existingIp && existingIp.status === 'blocked') {
-                        return res.status(403).json({ message: 'Access blocked for this IP address' });
-                    }
-                    if (existingIp && existingIp.status === 'whitelisted') {
-                        // Skip further tracking or just update lastActive
+                if (ipBlockingEnabled && !allowlist.has(ip)) {
+                    const globallyWhitelisted = await IpLog.findOne({ ip, status: 'whitelisted' }).select('_id');
+                    if (!globallyWhitelisted) {
+                        const existingIp = await IpLog.findOne(ownerFilter(req.user, userModel, ip)).select('status');
+                        if (existingIp && existingIp.status === 'blocked') {
+                            return res.status(403).json({ message: 'Access blocked for this IP address' });
+                        }
                     }
                 }
 
                 await IpLog.findOneAndUpdate(
-                    { userId: req.user._id, ip },
+                    ownerFilter(req.user, userModel, ip),
                     {
                         $set: {
                             userAgent: req.headers['user-agent'] || null,
-                            lastActive: new Date()
+                            lastActive: new Date(),
+                            userModel
                         },
                         $setOnInsert: {
                             country: 'Unknown',
                             city: 'Unknown',
-                            status: 'active'
+                            status: 'active',
+                            userModel
                         }
                     },
                     { upsert: true, new: true }

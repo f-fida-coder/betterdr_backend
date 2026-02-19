@@ -31,7 +31,9 @@ const {
 	updateThirdPartyLimit,
 	getAdminBets,
 	createAdminBet,
+	deleteAdminBet,
 	getAgentPerformance,
+	getAgentPerformanceDetails,
 	getIpTracker,
 	blockIp,
 	unblockIp,
@@ -58,6 +60,8 @@ const {
 	createRule,
 	updateRule,
 	deleteRule,
+	getBetModeRules,
+	updateBetModeRule,
 	getFeedback,
 	replyFeedback,
 	markFeedbackReviewed,
@@ -79,7 +83,9 @@ const {
 	fetchOddsManual,
 	updateUserFreeplay,
 	whitelistIp,
-	getAgentTree
+	getAgentTree,
+	deleteUser,
+	deleteAgent
 } = require('../controllers/adminController');
 const { protect } = require('../middleware/authMiddleware');
 const { adminOnly, adminOrAgent } = require('../middleware/roleMiddleware');
@@ -119,13 +125,15 @@ router.get('/cashier/transactions', protect, adminOnly, getCashierTransactions);
 router.get('/third-party-limits', protect, adminOnly, getThirdPartyLimits);
 router.post('/third-party-limits', protect, adminOnly, createThirdPartyLimit);
 router.put('/third-party-limits/:id', protect, adminOnly, updateThirdPartyLimit);
-router.get('/bets', protect, adminOnly, getAdminBets);
-router.post('/bets', protect, adminOnly, createAdminBet);
-router.get('/agent-performance', protect, adminOnly, getAgentPerformance);
-router.get('/ip-tracker', protect, adminOnly, getIpTracker);
-router.post('/ip-tracker/:id/block', protect, adminOnly, blockIp);
-router.post('/ip-tracker/:id/unblock', protect, adminOnly, unblockIp);
-router.post('/ip-tracker/:id/whitelist', protect, adminOnly, whitelistIp);
+router.get('/bets', protect, adminOrAgent, getAdminBets);
+router.post('/bets', protect, adminOrAgent, createAdminBet);
+router.delete('/bets/:id', protect, adminOrAgent, deleteAdminBet);
+router.get('/agent-performance', protect, adminOrAgent, getAgentPerformance);
+router.get('/agent-performance/:id/details', protect, adminOrAgent, getAgentPerformanceDetails);
+router.get('/ip-tracker', protect, adminOrAgent, getIpTracker);
+router.post('/ip-tracker/:id/block', protect, adminOrAgent, blockIp);
+router.post('/ip-tracker/:id/unblock', protect, adminOrAgent, unblockIp);
+router.post('/ip-tracker/:id/whitelist', protect, adminOrAgent, whitelistIp);
 router.get('/transactions', protect, adminOnly, getTransactionsHistory);
 router.get('/collections', protect, adminOnly, getCollections);
 router.post('/collections', protect, adminOnly, createCollection);
@@ -149,6 +157,8 @@ router.get('/rules', protect, adminOnly, getRules);
 router.post('/rules', protect, adminOnly, createRule);
 router.put('/rules/:id', protect, adminOnly, updateRule);
 router.delete('/rules/:id', protect, adminOnly, deleteRule);
+router.get('/bet-mode-rules', protect, adminOnly, getBetModeRules);
+router.put('/bet-mode-rules/:mode', protect, adminOnly, updateBetModeRule);
 router.get('/feedback', protect, adminOnly, getFeedback);
 router.post('/feedback/:id/reply', protect, adminOnly, replyFeedback);
 router.post('/feedback/:id/reviewed', protect, adminOnly, markFeedbackReviewed);
@@ -177,5 +187,9 @@ router.post('/impersonate-user/:id', protect, adminOrAgent, impersonateUser);
 
 // Agent Tree Route
 router.get('/agent-tree', protect, adminOrAgent, getAgentTree);
+
+// Delete Routes (Admin Only)
+router.delete('/users/:id', protect, adminOnly, deleteUser);
+router.delete('/agents/:id', protect, adminOnly, deleteAgent);
 
 module.exports = router;

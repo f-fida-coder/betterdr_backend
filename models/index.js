@@ -18,6 +18,8 @@ const Feedback = require('./Feedback');
 const Faq = require('./Faq');
 const ManualSection = require('./ManualSection');
 const BetLimit = require('./BetLimit');
+const BetModeRule = require('./BetModeRule');
+const CasinoGame = require('./CasinoGame');
 
 const db = {
     mongoose,
@@ -40,6 +42,8 @@ const db = {
     Faq,
     ManualSection,
     BetLimit,
+    BetModeRule,
+    CasinoGame,
 };
 
 // Note: Relationships are defined using refs in the schemas
