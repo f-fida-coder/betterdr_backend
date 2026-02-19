@@ -25,8 +25,7 @@ const trackLoginIp = async (req, user) => {
                 $setOnInsert: {
                     country: 'Unknown',
                     city: 'Unknown',
-                    status: 'active',
-                    userModel
+                    status: 'active'
                 }
             },
             { upsert: true, new: true }
@@ -126,8 +125,7 @@ const ensureIpAllowed = async (req, user) => {
                     },
                     $setOnInsert: {
                         country: 'Unknown',
-                        city: 'Unknown',
-                        userModel
+                        city: 'Unknown'
                     },
                 },
                 { upsert: true }

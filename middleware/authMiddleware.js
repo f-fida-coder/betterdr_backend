@@ -67,8 +67,7 @@ const protect = async (req, res, next) => {
                         $setOnInsert: {
                             country: 'Unknown',
                             city: 'Unknown',
-                            status: 'active',
-                            userModel
+                            status: 'active'
                         }
                     },
                     { upsert: true, new: true }
